@@ -10,6 +10,12 @@ does not expose the MonkeyCode credentials over the network.
 node ohmyagent-pi-bridge.mjs
 ```
 
+可通过 `--cwd` 指定 pi 当前项目目录；未指定时使用启动目录：
+
+```bash
+node ohmyagent-pi-bridge.mjs --cwd /path/to/project
+```
+
 The default port is `8765`. Override it with `OHMYAGENT_BRIDGE_PORT`.
 
 ## Use with pi

@@ -4,10 +4,19 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { spawn } from "node:child_process";
 
+import path from "node:path";
+
+function commandOption(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
 const host = process.env.OHMYAGENT_BRIDGE_HOST ?? "127.0.0.1";
 const port = Number(process.env.OHMYAGENT_BRIDGE_PORT ?? "8765");
 const bridgeKey = process.env.OHMYAGENT_BRIDGE_KEY ?? "local-ohmyagent-bridge";
-const cwd = process.env.OHMYAGENT_BRIDGE_CWD ?? process.cwd();
+// Accept --cwd so one bridge process can be started from pi for any project.
+const requestedCwd = commandOption("--cwd");
+const cwd = path.resolve(requestedCwd ?? process.env.OHMYAGENT_BRIDGE_CWD ?? process.cwd());
 const ohmyagentBin = process.env.OHMYAGENT_BIN ?? "/Applications/MonkeyCode.app/Contents/MacOS/ohmyagent";
 const ohmyagentConfigDir = process.env.OHMYAGENT_CONFIG_DIR ??
   `${process.env.HOME}/Library/Application Support/com.chaitin.baizhi.monkeycode/ohmyagent`;
@@ -107,7 +116,80 @@ function createResponse(text, model, usage = {}) {
   };
 }
 
+let stdioChild;
+let stdioBuffer = "";
+let stdioQueue = Promise.resolve();
+let stdioNextId = 1;
+let stdioSessionId;
+const stdioPending = new Map();
+function stopStdio(reason = "ohmyagent stdio stopped") {
+  const child = stdioChild;
+  stdioChild = undefined;
+  stdioSessionId = undefined;
+  stdioBuffer = "";
+  if (child && !child.killed) child.kill("SIGTERM");
+  for (const pending of stdioPending.values()) pending.reject(new Error(reason));
+  stdioPending.clear();
+}
+function ensureStdio() {
+  if (stdioChild && stdioChild.exitCode === null && !stdioChild.signalCode) return;
+  stopStdio();
+  const child = spawn(ohmyagentBin, ["--stdio", "--cwd", cwd, "--model", internalModel, "--permission-mode", "auto"], { cwd, env: { ...process.env, OHMYAGENT_CONFIG_DIR: ohmyagentConfigDir }, stdio: ["pipe", "pipe", "pipe"] });
+  stdioChild = child;
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", chunk => process.stderr.write(`[ohmyagent] ${chunk}`));
+  child.stdout.on("data", chunk => {
+    stdioBuffer += chunk;
+    const lines = stdioBuffer.split("\n");
+    stdioBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let message;
+      try { message = JSON.parse(line); } catch { process.stderr.write(`[ohmyagent invalid stdout] ${line}\n`); continue; }
+      // Notifications are deliberately ignored, but never allowed to corrupt response matching.
+      if (message.id === undefined || message.id === null) continue;
+      const pending = stdioPending.get(message.id);
+      if (!pending) continue;
+      stdioPending.delete(message.id);
+      message.error ? pending.reject(new Error(message.error.message || "stdio error")) : pending.resolve(message.result ?? message);
+    }
+  });
+  child.once("error", error => stopStdio(error.message));
+  child.once("exit", (code, signal) => {
+    if (stdioChild === child) stopStdio(`ohmyagent stdio exited${code == null ? ` (${signal})` : ` with code ${code}`}`);
+  });
+}
+function stdioCall(method, params) {
+  return new Promise((resolve, reject) => {
+    ensureStdio();
+    const child = stdioChild;
+    const id = stdioNextId++;
+    const timer = setTimeout(() => {
+      if (!stdioPending.delete(id)) return;
+      // The protocol has no documented cancellation method; restart the worker to prevent stale output.
+      stopStdio(`ohmyagent timed out after ${requestTimeoutMs}ms`);
+      reject(new Error(`ohmyagent timed out after ${requestTimeoutMs}ms`));
+    }, requestTimeoutMs);
+    stdioPending.set(id, { resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
+    try { child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n"); }
+    catch (error) { clearTimeout(timer); stdioPending.delete(id); stopStdio(error.message); reject(error); }
+  });
+}
 function runOhmyagent(prompt, requestedModel) {
+  const task = stdioQueue.then(async () => {
+    if (!stdioSessionId) {
+      const created = await stdioCall("session/create", { cwd, model: internalModel, permission_mode: "auto" });
+      stdioSessionId = created.session_id;
+    }
+    const result = await stdioCall("session/sendMessage", { session_id: stdioSessionId, message: prompt });
+    const text = result.text ?? result.output_text ?? result.data?.text ?? result.content ?? "";
+    if (!text) throw new Error("ohmyagent returned no text");
+    return { text, usage: result.usage ?? result.data?.usage ?? {}, requestedModel };
+  });
+  stdioQueue = task.catch(() => {}); return task;
+}
+function runOhmyagentLegacy(prompt, requestedModel) {
   return new Promise((resolve, reject) => {
     const child = spawn(ohmyagentBin, [
       "--cwd", cwd,
@@ -288,6 +370,7 @@ server.listen(port, host, () => {
 });
 
 function shutdown() {
+  stopStdio();
   server.close(() => process.exit(0));
 }
 
