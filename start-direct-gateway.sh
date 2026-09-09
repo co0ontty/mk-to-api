@@ -57,7 +57,9 @@ running_pid() {
 
 health_check() {
   curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 \
-    "http://$HOST:$PORT/health" 2>/dev/null | grep -Fq '"ok":true,"mode":"direct-signed-gateway"'
+    "http://$HOST:$PORT/health" 2>/dev/null | grep -Fq '"ok":true' &&
+    curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 \
+      "http://$HOST:$PORT/health" 2>/dev/null | grep -Fq '"mode":"direct-signed-gateway"'
 }
 
 report_health_failure() {
