@@ -836,7 +836,8 @@ async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response
     let usage = state.usage.lock().await;
     json_response(&request, &state.config, StatusCode::OK, usage.summary())
 }
-async fn listener(ConnectInfo(remote): ConnectInfo<SocketAddr>, State(state): State<AppState>, request: Request<Body>) -> Response {
+async fn listener(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let remote = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0).unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let path = request.uri().path().trim_end_matches('/').to_string(); let path = if path.is_empty() { "/".to_string() } else { path };
     if !ip_allowed(&request, &state.config, remote) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "client IP is not allowed").with_type("permission_error").with_code("ip_not_allowed")); }
     if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
