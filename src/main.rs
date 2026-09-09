@@ -675,6 +675,19 @@ async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime,
     Ok(Runtime { base_url, api_key, model, signing_secret: signing_secret.unwrap(), model_ids: models.values().filter_map(|v| v.get("model").and_then(Value::as_str).map(str::to_string)).collect() })
 }
 
+async fn configured_model_ids(config: &Config) -> Result<Vec<String>, GatewayError> {
+    let settings = json_file(&config.settings_path, "OhMyAgent settings").await?;
+    let models = settings.get("models").and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut ids = Vec::new();
+    for id in models.values().filter_map(|entry| entry.get("model").and_then(Value::as_str)) {
+        let id = id.to_string();
+        if !ids.contains(&id) { ids.push(id.clone()); }
+        let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1);
+        if !ids.contains(&short) { ids.push(short); }
+    }
+    Ok(ids)
+}
+
 async fn request_upstream(state: &AppState, outgoing: &Value, runtime: &Runtime) -> Result<reqwest::Response, GatewayError> {
     let prompt = developer_prompt(outgoing);
     let mut signer = HmacSha256::new_from_slice(runtime.signing_secret.as_bytes()).map_err(|_| GatewayError::config("invalid signing_secret"))?;
@@ -870,7 +883,10 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     let token = bearer_token(&request).map(str::to_owned);
     let Some(key_id) = authenticated_key_id(token, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
     if request.method() == axum::http::Method::GET && (path == "/models" || path == "/v1/models") {
-        return match load_runtime(&state.config, "gpt-6-astra").await { Ok(runtime) => { let mut ids = Vec::new(); for id in runtime.model_ids { if !ids.contains(&id) { ids.push(id.clone()); } let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1); if !ids.contains(&short) { ids.push(short); } } json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": ids.into_iter().map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "monkeycode"})).collect::<Vec<_>>() })) }, Err(e) => error_response(&request, &state.config, e) };
+        return match configured_model_ids(&state.config).await {
+            Ok(ids) => json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": ids.into_iter().map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "monkeycode"})).collect::<Vec<_>>() })),
+            Err(e) => error_response(&request, &state.config, e),
+        };
     }
     if request.method() == axum::http::Method::POST && (path == "/responses" || path == "/v1/responses") { return handle_responses(request, state, key_id).await; }
     if request.method() == axum::http::Method::POST && (path == "/chat/completions" || path == "/v1/chat/completions") { return handle_chat(request, state, key_id).await; }
