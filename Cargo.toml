@@ -5,7 +5,7 @@ edition = "2021"
 description = "OpenAI-compatible signed forwarding gateway for MonkeyCode"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 hex = "0.4"

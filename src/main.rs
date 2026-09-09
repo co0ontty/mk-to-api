@@ -836,6 +836,7 @@ async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response
     let usage = state.usage.lock().await;
     json_response(&request, &state.config, StatusCode::OK, usage.summary())
 }
+#[axum::debug_handler]
 async fn listener(State(state): State<AppState>, request: Request<Body>) -> Response {
     let remote = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0).unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let path = request.uri().path().trim_end_matches('/').to_string(); let path = if path.is_empty() { "/".to_string() } else { path };
