@@ -2,23 +2,20 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_SCRIPT="$SCRIPT_DIR/direct-gateway-server.mjs"
+SERVER_BINARY="${DIRECT_GATEWAY_BIN:-$SCRIPT_DIR/target/release/monkeycode-direct-gateway}"
+MANIFEST_FILE="$SCRIPT_DIR/Cargo.toml"
 PID_FILE="${DIRECT_GATEWAY_PID_FILE:-$HOME/.monkeycode-direct-gateway.pid}"
 LOG_FILE="${DIRECT_GATEWAY_LOG_FILE:-$HOME/Library/Logs/monkeycode-direct-gateway.log}"
-HOST="${DIRECT_GATEWAY_HOST:-127.0.0.1}"
+HOST="${DIRECT_GATEWAY_HOST:-0.0.0.0}"
 PORT="${DIRECT_GATEWAY_PORT:-8123}"
-LOCAL_KEY="${DIRECT_GATEWAY_KEY:-local-monkeycode-direct}"
+LOCAL_KEY="${DIRECT_GATEWAY_KEY:-}"
 LABEL="${DIRECT_GATEWAY_LAUNCH_LABEL:-com.monkeycode.direct-gateway}"
 LAUNCH_DOMAIN="${DIRECT_GATEWAY_LAUNCH_DOMAIN:-gui/$(id -u)}"
 PLIST_FILE="${DIRECT_GATEWAY_PLIST_FILE:-$HOME/Library/LaunchAgents/$LABEL.plist}"
 SERVICE_TARGET="$LAUNCH_DOMAIN/$LABEL"
 LAUNCHCTL="${LAUNCHCTL:-/bin/launchctl}"
 PLUTIL="${PLUTIL:-/usr/bin/plutil}"
-NODE_BIN="${DIRECT_GATEWAY_NODE:-}"
-
-if [ -z "$NODE_BIN" ]; then
-  NODE_BIN="$(command -v node || true)"
-fi
+CARGO_BIN="${CARGO_BIN:-$(command -v cargo || true)}"
 
 mkdir -p "$(dirname -- "$LOG_FILE")" "$(dirname -- "$PLIST_FILE")"
 
@@ -43,7 +40,7 @@ service_pid() {
 pid_is_server() {
   local pid="$1"
   kill -0 "$pid" 2>/dev/null || return 1
-  ps -p "$pid" -o command= 2>/dev/null | grep -Fq "$SERVER_SCRIPT"
+  ps -p "$pid" -o command= 2>/dev/null | grep -Fq "$SERVER_BINARY"
 }
 
 running_pid() {
@@ -60,17 +57,7 @@ running_pid() {
 
 health_check() {
   curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 \
-    "http://$HOST:$PORT/health" 2>/dev/null |
-    "$NODE_BIN" -e '
-      let data = "";
-      process.stdin.on("data", chunk => data += chunk);
-      process.stdin.on("end", () => {
-        try {
-          const health = JSON.parse(data);
-          process.exit(health.ok === true && health.mode === "direct-signed-gateway" ? 0 : 1);
-        } catch { process.exit(1); }
-      });
-    '
+    "http://$HOST:$PORT/health" 2>/dev/null | grep -Fq '"ok":true,"mode":"direct-signed-gateway"'
 }
 
 report_health_failure() {
@@ -112,13 +99,17 @@ write_pid_file() {
 
 write_plist() {
   local target="$1"
-  local escaped_node escaped_script escaped_host escaped_port escaped_key escaped_log
-  escaped_node="$(xml_escape "$NODE_BIN")"
-  escaped_script="$(xml_escape "$SERVER_SCRIPT")"
+  local escaped_binary escaped_host escaped_port escaped_key escaped_log key_env
+  escaped_binary="$(xml_escape "$SERVER_BINARY")"
   escaped_host="$(xml_escape "$HOST")"
   escaped_port="$(xml_escape "$PORT")"
   escaped_key="$(xml_escape "$LOCAL_KEY")"
   escaped_log="$(xml_escape "$LOG_FILE")"
+  key_env=""
+  if [ -n "$LOCAL_KEY" ]; then
+    key_env="    <key>DIRECT_GATEWAY_KEY</key>
+    <string>$escaped_key</string>"
+  fi
 
   cat >"$target" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -129,8 +120,7 @@ write_plist() {
   <string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$escaped_node</string>
-    <string>$escaped_script</string>
+    <string>$escaped_binary</string>
   </array>
   <key>WorkingDirectory</key>
   <string>$SCRIPT_DIR</string>
@@ -140,8 +130,7 @@ write_plist() {
     <string>$escaped_host</string>
     <key>DIRECT_GATEWAY_PORT</key>
     <string>$escaped_port</string>
-    <key>DIRECT_GATEWAY_KEY</key>
-    <string>$escaped_key</string>
+$key_env
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -174,9 +163,13 @@ show_running() {
 }
 
 start_server() {
-  if [ ! -x "$NODE_BIN" ]; then
-    echo "node executable not found: ${NODE_BIN:-<empty>}" >&2
-    return 1
+  if [ ! -x "$SERVER_BINARY" ]; then
+    if [ -z "$CARGO_BIN" ]; then
+      echo "Rust binary not found and cargo executable is unavailable: $SERVER_BINARY" >&2
+      return 1
+    fi
+    echo "building Rust direct gateway"
+    "$CARGO_BIN" build --release --manifest-path "$MANIFEST_FILE"
   fi
 
   local candidate
@@ -197,21 +190,20 @@ start_server() {
   rm -f "$PID_FILE"
 
   # Probe the actual bind address; never kill an unrelated listener.
-  if ! "$NODE_BIN" --input-type=module - "$HOST" "$PORT" <<'NODE'
-import net from 'node:net';
-const host = process.argv[2];
-const port = Number(process.argv[3]);
-if (!Number.isInteger(port) || port < 1 || port > 65535) {
-  console.error('invalid gateway port');
-  process.exit(1);
-}
-const probe = net.createServer();
-probe.on('error', error => {
-  console.error(`cannot listen on ${host}:${port}: ${error.code}`);
-  process.exit(1);
-});
-probe.listen({ host, port, exclusive: true }, () => probe.close());
-NODE
+  if ! python3 - "$HOST" "$PORT" <<'PY'
+import socket
+import sys
+host, port = sys.argv[1], int(sys.argv[2])
+probe = socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_STREAM)
+try:
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    probe.bind((host, port))
+except OSError as error:
+    print(f'cannot listen on {host}:{port}: {error}', file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    probe.close()
+PY
   then
     rm -f "$candidate"
     report_health_failure

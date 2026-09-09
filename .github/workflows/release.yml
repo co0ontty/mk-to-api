@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch: aarch64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch: x86_64
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package asset
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/monkeycode-direct-gateway dist/monkeycode-direct-gateway
+          cp start-direct-gateway.sh dist/start-direct-gateway.sh
+          chmod 755 dist/monkeycode-direct-gateway dist/start-direct-gateway.sh
+          tar -czf monkeycode-direct-gateway-macos-${{ matrix.arch }}.tar.gz -C dist monkeycode-direct-gateway start-direct-gateway.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: monkeycode-direct-gateway-macos-${{ matrix.arch }}.tar.gz
+
+  publish-assets:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh release upload "$TAG_NAME" dist/*.tar.gz --repo "$REPOSITORY" --clobber

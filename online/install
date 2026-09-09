@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="${MONKEYCODE_REPO:-co0ontty/mk-to-api}"
+VERSION="${MONKEYCODE_VERSION:-latest}"
+INSTALL_ROOT="${MONKEYCODE_INSTALL_ROOT:-$HOME/.local/lib/monkeycode-gateway}"
+BIN_DIR="${MONKEYCODE_BIN_DIR:-$HOME/.local/bin}"
+
+case "$(uname -s)" in
+  Darwin) ;;
+  *) echo "MonkeyCode Direct Gateway currently supports macOS only." >&2; exit 1 ;;
+esac
+
+case "$(uname -m)" in
+  arm64|aarch64) ARCH="aarch64" ;;
+  x86_64|amd64) ARCH="x86_64" ;;
+  *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+ASSET="monkeycode-direct-gateway-macos-${ARCH}.tar.gz"
+if [ "$VERSION" = "latest" ]; then
+  URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+else
+  case "$VERSION" in v*) TAG="$VERSION" ;; *) TAG="v$VERSION" ;; esac
+  URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+fi
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/monkeycode-install.XXXXXX")"
+cleanup() { rm -rf "$TMP_DIR"; }
+trap cleanup EXIT
+
+printf 'Downloading %s...\n' "$URL"
+curl --fail --location --silent --show-error "$URL" -o "$TMP_DIR/$ASSET"
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
+tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
+
+if [ ! -x "$TMP_DIR/monkeycode-direct-gateway" ]; then
+  echo "Release archive does not contain monkeycode-direct-gateway" >&2
+  exit 1
+fi
+
+install -m 755 "$TMP_DIR/monkeycode-direct-gateway" "$INSTALL_ROOT/monkeycode-direct-gateway"
+install -m 755 "$TMP_DIR/start-direct-gateway.sh" "$INSTALL_ROOT/start-direct-gateway.sh"
+
+cat > "$BIN_DIR/monkeycode-gateway" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec env DIRECT_GATEWAY_BIN="$INSTALL_ROOT/monkeycode-direct-gateway" "$INSTALL_ROOT/start-direct-gateway.sh" "\$@"
+EOF
+chmod 755 "$BIN_DIR/monkeycode-gateway"
+
+printf '\nInstalled MonkeyCode Direct Gateway to %s\n' "$INSTALL_ROOT"
+printf 'Command: %s/monkeycode-gateway\n' "$BIN_DIR"
+printf 'Admin UI: http://0.0.0.0:8123/admin\n'
+
+if [ "${MONKEYCODE_GATEWAY_START:-1}" = "1" ]; then
+  "$BIN_DIR/monkeycode-gateway" start
+else
+  printf 'Automatic start disabled. Run: %s/monkeycode-gateway start\n' "$BIN_DIR"
+fi
