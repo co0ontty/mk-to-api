@@ -12,12 +12,23 @@ const flag = (name, fallback) => {
 };
 
 const defaultConfigDir = path.join(os.homedir(), 'Library/Application Support/com.chaitin.baizhi.monkeycode');
-const configDir = process.env.MONKEYCODE_CONFIG_DIR || defaultConfigDir;
-const keyPath = process.env.MONKEYCODE_OHMYAGENT_KEY || path.join(configDir, 'monkeycode-ohmyagent-key.json');
-const settingsPath = process.env.OHMYAGENT_SETTINGS || path.join(configDir, 'ohmyagent/settings.json');
-const requestedModel = flag('--model', process.env.MODEL || 'gpt-6-astra');
-const prompt = flag('--prompt', process.env.PROMPT || 'Reply with OK only.');
-const systemPrompt = flag('--system', process.env.SYSTEM || 'You are a helpful assistant.');
+const configPath = flag('--config', process.env.MONKEYCODE_GATEWAY_CONFIG || path.join(defaultConfigDir, 'direct-gateway.json'));
+let fileConfig = {};
+try {
+  fileConfig = JSON.parse(await fs.readFile(configPath, 'utf8'));
+} catch (error) {
+  if (error.code !== 'ENOENT') fail(`cannot read gateway config: ${configPath} (${error.message})`);
+}
+const config = { ...fileConfig };
+const configValue = (name, fallback) => config[name.replaceAll('-', '_')] ?? config[name] ?? fallback;
+const configured = (name, envName, fallback) => flag(`--${name}`, process.env[envName] ?? configValue(name, fallback));
+
+const configDir = configured('config-dir', 'MONKEYCODE_CONFIG_DIR', defaultConfigDir);
+const keyPath = configured('key-file', 'MONKEYCODE_OHMYAGENT_KEY', path.join(configDir, 'monkeycode-ohmyagent-key.json'));
+const settingsPath = configured('settings', 'OHMYAGENT_SETTINGS', path.join(configDir, 'ohmyagent/settings.json'));
+const requestedModel = configured('model', 'MODEL', 'gpt-6-astra');
+const prompt = configured('prompt', 'PROMPT', 'Reply with OK only.');
+const systemPrompt = configured('system', 'SYSTEM', 'You are a helpful assistant.');
 const stream = args.includes('--stream');
 
 function fail(message) {
@@ -36,24 +47,26 @@ async function readJson(filePath, label) {
 const keyConfig = await readJson(keyPath, 'OhMyAgent key');
 const settings = await readJson(settingsPath, 'OhMyAgent settings');
 const models = Object.values(settings.models || {});
-const proxyBaseUrl = String(keyConfig.base_url || '').replace(/\/$/, '');
+const proxyBaseUrl = String(config.upstream_host ?? config.host ?? keyConfig.base_url ?? '').replace(/\/$/, '');
+const configuredApiKey = config.upstream_key ?? config.api_key ?? config.key ?? keyConfig.api_key;
+const signingSecret = config.signing_secret || keyConfig.signing_secret;
 const normalizedModel = requestedModel.includes('/') ? requestedModel : `monkeycode-ultra/${requestedModel}`;
 const modelConfig = models.find((entry) => (
   entry.base_url === proxyBaseUrl &&
   (entry.model === requestedModel || entry.model === normalizedModel)
 ));
 
-if (!proxyBaseUrl || !keyConfig.api_key || !keyConfig.signing_secret) {
-  fail('OhMyAgent key is missing base_url, api_key, or signing_secret');
+if (!proxyBaseUrl || !configuredApiKey || !signingSecret) {
+  fail('gateway config is missing host, key, or signing_secret');
 }
 if (!modelConfig) {
   fail(`proxy model is not configured: ${requestedModel}`);
 }
 
 const model = modelConfig.model;
-const apiKey = modelConfig.api_key || keyConfig.api_key;
+const apiKey = modelConfig.api_key || configuredApiKey;
 const signature = crypto
-  .createHmac('sha256', keyConfig.signing_secret)
+  .createHmac('sha256', signingSecret)
   .update(systemPrompt, 'utf8')
   .digest('hex');
 const body = {

@@ -6,7 +6,7 @@ SERVER_SCRIPT="$SCRIPT_DIR/direct-gateway-server.mjs"
 PID_FILE="${DIRECT_GATEWAY_PID_FILE:-$HOME/.monkeycode-direct-gateway.pid}"
 LOG_FILE="${DIRECT_GATEWAY_LOG_FILE:-$HOME/Library/Logs/monkeycode-direct-gateway.log}"
 HOST="${DIRECT_GATEWAY_HOST:-127.0.0.1}"
-PORT="${DIRECT_GATEWAY_PORT:-8765}"
+PORT="${DIRECT_GATEWAY_PORT:-8123}"
 LOCAL_KEY="${DIRECT_GATEWAY_KEY:-local-monkeycode-direct}"
 LABEL="${DIRECT_GATEWAY_LAUNCH_LABEL:-com.monkeycode.direct-gateway}"
 LAUNCH_DOMAIN="${DIRECT_GATEWAY_LAUNCH_DOMAIN:-gui/$(id -u)}"
@@ -59,8 +59,18 @@ running_pid() {
 }
 
 health_check() {
-  curl -fsS --connect-timeout 2 --max-time 5 \
-    "http://$HOST:$PORT/health" >/dev/null
+  curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 \
+    "http://$HOST:$PORT/health" 2>/dev/null |
+    "$NODE_BIN" -e '
+      let data = "";
+      process.stdin.on("data", chunk => data += chunk);
+      process.stdin.on("end", () => {
+        try {
+          const health = JSON.parse(data);
+          process.exit(health.ok === true && health.mode === "direct-signed-gateway" ? 0 : 1);
+        } catch { process.exit(1); }
+      });
+    '
 }
 
 report_health_failure() {
@@ -68,7 +78,7 @@ report_health_failure() {
   local headers_file="${TMPDIR:-/tmp}/monkeycode-direct-gateway-health.$$.headers"
   local status
 
-  status="$(curl -sS --connect-timeout 2 --max-time 5 \
+  status="$(curl -sS --noproxy '*' --connect-timeout 2 --max-time 5 \
     -D "$headers_file" -o "$body_file" -w '%{http_code}' \
     "http://$HOST:$PORT/health" 2>&1)" || true
   echo "health check failed: http://$HOST:$PORT/health (HTTP ${status:-000})" >&2
@@ -101,6 +111,7 @@ write_pid_file() {
 }
 
 write_plist() {
+  local target="$1"
   local escaped_node escaped_script escaped_host escaped_port escaped_key escaped_log
   escaped_node="$(xml_escape "$NODE_BIN")"
   escaped_script="$(xml_escape "$SERVER_SCRIPT")"
@@ -109,7 +120,7 @@ write_plist() {
   escaped_key="$(xml_escape "$LOCAL_KEY")"
   escaped_log="$(xml_escape "$LOG_FILE")"
 
-  cat >"$PLIST_FILE" <<PLIST
+  cat >"$target" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -146,8 +157,8 @@ write_plist() {
 </plist>
 PLIST
 
-  "$PLUTIL" -lint "$PLIST_FILE" >/dev/null
-  chmod 600 "$PLIST_FILE"
+  "$PLUTIL" -lint "$target" >/dev/null || return 1
+  chmod 600 "$target"
 }
 
 show_running() {
@@ -158,7 +169,7 @@ show_running() {
   else
     echo "direct gateway is running"
   fi
-  curl -fsS "http://$HOST:$PORT/health"
+  curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "http://$HOST:$PORT/health"
   echo
 }
 
@@ -168,22 +179,50 @@ start_server() {
     return 1
   fi
 
+  local candidate
+  candidate="$(mktemp "${PLIST_FILE}.XXXXXX")"
+  if ! write_plist "$candidate"; then
+    rm -f "$candidate"
+    return 1
+  fi
+
+  # Reload even if healthy: the loaded job may differ from the plist on disk.
   if service_loaded; then
-    if health_check; then
-      write_pid_file
-      show_running
-      return 0
+    echo "reloading $SERVICE_TARGET with current configuration ($HOST:$PORT)"
+    if ! "$LAUNCHCTL" bootout "$SERVICE_TARGET"; then
+      rm -f "$candidate"
+      return 1
     fi
-    echo "direct gateway service is loaded but unhealthy; restarting" >&2
-    "$LAUNCHCTL" kickstart -k "$SERVICE_TARGET"
-  else
-    if health_check; then
-      echo "port $PORT is already serving an unmanaged direct gateway" >&2
-      return 0
-    fi
-    write_plist
-    "$LAUNCHCTL" bootstrap "$LAUNCH_DOMAIN" "$PLIST_FILE"
-    "$LAUNCHCTL" kickstart -k "$SERVICE_TARGET"
+  fi
+  rm -f "$PID_FILE"
+
+  # Probe the actual bind address; never kill an unrelated listener.
+  if ! "$NODE_BIN" --input-type=module - "$HOST" "$PORT" <<'NODE'
+import net from 'node:net';
+const host = process.argv[2];
+const port = Number(process.argv[3]);
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  console.error('invalid gateway port');
+  process.exit(1);
+}
+const probe = net.createServer();
+probe.on('error', error => {
+  console.error(`cannot listen on ${host}:${port}: ${error.code}`);
+  process.exit(1);
+});
+probe.listen({ host, port, exclusive: true }, () => probe.close());
+NODE
+  then
+    rm -f "$candidate"
+    report_health_failure
+    echo "choose a free DIRECT_GATEWAY_PORT and run start again" >&2
+    return 1
+  fi
+
+  mv -f "$candidate" "$PLIST_FILE"
+  if ! "$LAUNCHCTL" bootstrap "$LAUNCH_DOMAIN" "$PLIST_FILE"; then
+    report_health_failure
+    return 1
   fi
 
   for _ in {1..20}; do
@@ -204,7 +243,8 @@ start_server() {
     tail -30 "$LOG_FILE" >&2 || true
   fi
   if service_loaded; then
-    "$LAUNCHCTL" print "$SERVICE_TARGET" >&2 || true
+    echo "unloading failed service to stop automatic crash retries" >&2
+    "$LAUNCHCTL" bootout "$SERVICE_TARGET" || true
   fi
   return 1
 }
@@ -260,7 +300,7 @@ status_server() {
 
   if health_check; then
     echo "direct gateway responds on port $PORT but is not managed by this script" >&2
-    curl -fsS "http://$HOST:$PORT/health"
+    curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "http://$HOST:$PORT/health"
     echo
     return 0
   fi
