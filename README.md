@@ -5,6 +5,28 @@ or use the local `ohmyagent` CLI as a forwarding process.
 
 ## Direct call
 
+启动本地直连网关：
+
+```bash
+./start-direct-gateway.sh start
+```
+
+查看状态和健康信息：
+
+```bash
+./start-direct-gateway.sh status
+```
+
+停止或重启：
+
+```bash
+./start-direct-gateway.sh stop
+./start-direct-gateway.sh restart
+```
+
+默认监听 `127.0.0.1:8765`，日志写入
+`~/Library/Logs/monkeycode-direct-gateway.log`。
+
 ```bash
 node direct-gateway.mjs --model gpt-6-astra --prompt "Reply with OK only."
 ```
