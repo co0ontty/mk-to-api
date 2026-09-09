@@ -16,6 +16,16 @@ bash -c "$(curl -fsSL 'https://raw.githubusercontent.com/co0ontty/mk-to-api/main
 
 安装程序会自动识别 Apple Silicon/Intel，下载对应 GitHub Release，安装 launchd 管理命令并启动网关。
 
+已安装版本可用以下命令检查和更新：
+
+```bash
+monkeycode-gateway version
+monkeycode-gateway check-update
+monkeycode-gateway update
+```
+
+`update` 只替换程序和启动脚本，不会删除或重置配置、Admin Key、客户端 Key、用量数据。
+
 ## Direct call
 
 启动本地直连网关（需要 Rust/Cargo）：

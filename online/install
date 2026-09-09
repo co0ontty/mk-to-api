@@ -38,14 +38,42 @@ if [ ! -x "$TMP_DIR/monkeycode-direct-gateway" ]; then
   echo "Release archive does not contain monkeycode-direct-gateway" >&2
   exit 1
 fi
+if [ ! -f "$TMP_DIR/VERSION" ]; then
+  printf '%s\n' "$VERSION" > "$TMP_DIR/VERSION"
+fi
 
 install -m 755 "$TMP_DIR/monkeycode-direct-gateway" "$INSTALL_ROOT/monkeycode-direct-gateway"
 install -m 755 "$TMP_DIR/start-direct-gateway.sh" "$INSTALL_ROOT/start-direct-gateway.sh"
+install -m 644 "$TMP_DIR/VERSION" "$INSTALL_ROOT/VERSION"
 
+INSTALLER_URL="https://raw.githubusercontent.com/${REPO}/main/online/install?download=1"
 cat > "$BIN_DIR/monkeycode-gateway" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec env DIRECT_GATEWAY_BIN="$INSTALL_ROOT/monkeycode-direct-gateway" "$INSTALL_ROOT/start-direct-gateway.sh" "\$@"
+INSTALL_ROOT="$INSTALL_ROOT"
+BIN_DIR="$BIN_DIR"
+VERSION_FILE="\$INSTALL_ROOT/VERSION"
+INSTALLER_URL="$INSTALLER_URL"
+
+case "\${1:-start}" in
+  update)
+    echo "Updating MonkeyCode Direct Gateway from GitHub Release..."
+    exec env MONKEYCODE_VERSION=latest MONKEYCODE_GATEWAY_START=1 MONKEYCODE_INSTALL_ROOT="\$INSTALL_ROOT" MONKEYCODE_BIN_DIR="\$BIN_DIR" bash -c "\$(curl --fail --location --silent --show-error \"\$INSTALLER_URL\")"
+    ;;
+  version)
+    if [ -f "\$VERSION_FILE" ]; then cat "\$VERSION_FILE"; else echo "unknown"; fi
+    ;;
+  check-update)
+    current="\$(if [ -f \"\$VERSION_FILE\" ]; then cat \"\$VERSION_FILE\"; else echo unknown; fi)"
+    latest="\$(curl --fail --location --silent --show-error "https://api.github.com/repos/${REPO}/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+    echo "installed: \$current"
+    echo "latest:    \$latest"
+    if [ "\$current" = "\$latest" ]; then echo "already up to date"; else echo "update available: run monkeycode-gateway update"; fi
+    ;;
+  *)
+    exec env DIRECT_GATEWAY_BIN="\$INSTALL_ROOT/monkeycode-direct-gateway" "\$INSTALL_ROOT/start-direct-gateway.sh" "\$@"
+    ;;
+esac
 EOF
 chmod 755 "$BIN_DIR/monkeycode-gateway"
 

@@ -39,7 +39,8 @@ jobs:
           cp target/${{ matrix.target }}/release/monkeycode-direct-gateway dist/monkeycode-direct-gateway
           cp start-direct-gateway.sh dist/start-direct-gateway.sh
           chmod 755 dist/monkeycode-direct-gateway dist/start-direct-gateway.sh
-          tar -czf monkeycode-direct-gateway-macos-${{ matrix.arch }}.tar.gz -C dist monkeycode-direct-gateway start-direct-gateway.sh
+          printf '%s\n' '${{ github.event.release.tag_name }}' > dist/VERSION
+          tar -czf monkeycode-direct-gateway-macos-${{ matrix.arch }}.tar.gz -C dist monkeycode-direct-gateway start-direct-gateway.sh VERSION
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
