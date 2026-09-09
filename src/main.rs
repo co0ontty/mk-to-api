@@ -1,6 +1,6 @@
 use axum::{
     body::{to_bytes, Body, Bytes},
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     response::{IntoResponse, Response},
     Router,
@@ -437,11 +437,11 @@ fn legacy_authorized(request: &Request<Body>, config: &Config) -> bool {
     !config.auth_required || (!config.local_key.is_empty() && safe_equal(bearer_token(request), &config.local_key))
 }
 
-async fn authenticated_key_id(request: &Request<Body>, state: &AppState) -> Option<String> {
+async fn authenticated_key_id(token: Option<String>, state: &AppState) -> Option<String> {
     if !state.config.auth_required { return Some("anonymous".into()); }
-    if !state.config.local_key.is_empty() && safe_equal(bearer_token(request), &state.config.local_key) { return Some("legacy".into()); }
-    let token = bearer_token(request)?;
-    let hash = hash_key(token);
+    let token = token?;
+    if !state.config.local_key.is_empty() && safe_equal(Some(token.as_str()), &state.config.local_key) { return Some("legacy".into()); }
+    let hash = hash_key(&token);
     let keys = {
         let store = state.api_keys.lock().await;
         store.keys.iter().find(|key| !key.revoked && safe_equal(Some(hash.as_str()), key.key_hash.as_str())).map(|key| key.id.clone())
@@ -867,7 +867,8 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
         }
         if request.method() == axum::http::Method::DELETE { return handle_admin_keys(request, state, Some(key_id), "revoke").await; }
     }
-    let Some(key_id) = authenticated_key_id(&request, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
+    let token = bearer_token(&request).map(str::to_owned);
+    let Some(key_id) = authenticated_key_id(token, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
     if request.method() == axum::http::Method::GET && (path == "/models" || path == "/v1/models") {
         return match load_runtime(&state.config, "gpt-6-astra").await { Ok(runtime) => { let mut ids = Vec::new(); for id in runtime.model_ids { if !ids.contains(&id) { ids.push(id.clone()); } let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1); if !ids.contains(&short) { ids.push(short); } } json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": ids.into_iter().map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "monkeycode"})).collect::<Vec<_>>() })) }, Err(e) => error_response(&request, &state.config, e) };
     }
