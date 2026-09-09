@@ -11,7 +11,7 @@ bash -c "$(curl -fsSL 'https://monkeycode-ai.com/online/install')"
 也可以使用 GitHub Raw 安装入口：
 
 ```bash
-bash -c "$(curl -fsSL 'https://raw.githubusercontent.com/co0ontty/mk-to-api/main/online/install')"
+bash -c "$(curl -fsSL 'https://raw.githubusercontent.com/co0ontty/mk-to-api/main/online/install?v=22af0d4')"
 ```
 
 安装程序会自动识别 Apple Silicon/Intel，下载对应 GitHub Release，安装 launchd 管理命令并启动网关。

@@ -30,7 +30,7 @@ cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
 printf 'Downloading %s...\n' "$URL"
-curl --fail --location --silent --show-error "$URL" -o "$TMP_DIR/$ASSET"
+curl --fail --location --silent --show-error "$URL?download=1" -o "$TMP_DIR/$ASSET"
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
