@@ -63,6 +63,35 @@ health_check() {
     "http://$HOST:$PORT/health" >/dev/null
 }
 
+report_health_failure() {
+  local body_file="${TMPDIR:-/tmp}/monkeycode-direct-gateway-health.$$.body"
+  local headers_file="${TMPDIR:-/tmp}/monkeycode-direct-gateway-health.$$.headers"
+  local status
+
+  status="$(curl -sS --connect-timeout 2 --max-time 5 \
+    -D "$headers_file" -o "$body_file" -w '%{http_code}' \
+    "http://$HOST:$PORT/health" 2>&1)" || true
+  echo "health check failed: http://$HOST:$PORT/health (HTTP ${status:-000})" >&2
+  if [ -s "$headers_file" ]; then
+    echo "response headers:" >&2
+    head -20 "$headers_file" >&2 || true
+  fi
+  if [ -s "$body_file" ]; then
+    echo "response body:" >&2
+    head -c 1000 "$body_file" >&2 || true
+    echo >&2
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    echo "processes listening on $HOST:$PORT:" >&2
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2 || true
+  fi
+  if service_loaded; then
+    echo "launchd service status:" >&2
+    "$LAUNCHCTL" print "$SERVICE_TARGET" >&2 || true
+  fi
+  rm -f "$body_file" "$headers_file"
+}
+
 write_pid_file() {
   local pid
   pid="$(service_pid || true)"
@@ -169,7 +198,9 @@ start_server() {
   done
 
   echo "failed to start direct gateway; see $LOG_FILE" >&2
+  report_health_failure
   if [ -f "$LOG_FILE" ]; then
+    echo "last 30 log lines:" >&2
     tail -30 "$LOG_FILE" >&2 || true
   fi
   if service_loaded; then
