@@ -257,12 +257,16 @@ impl ApiKeyStore {
         Ok(Self { path, keys })
     }
 
-    async fn save(&self) -> Result<(), BoxError> {
+    fn serialized(&self) -> Result<String, BoxError> {
         let value = json!({"keys": self.keys.iter().map(|key| json!({
             "id": key.id, "name": key.name, "key_hash": key.key_hash,
             "created_at": key.created_at, "revoked": key.revoked,
         })).collect::<Vec<_>>()});
-        write_private(&self.path, &serde_json::to_string_pretty(&value)?).await
+        Ok(serde_json::to_string_pretty(&value)?)
+    }
+
+    async fn save(&self) -> Result<(), BoxError> {
+        write_private(&self.path, &self.serialized()?).await
     }
 
     fn public_key(key: &ApiKeyRecord) -> Value {
@@ -295,7 +299,7 @@ impl UsageStore {
         Ok(Self { path, max_records, records: records[start..].to_vec() })
     }
 
-    async fn record(&mut self, record: UsageRecord) -> Result<(), BoxError> {
+    fn record(&mut self, record: UsageRecord) -> Result<(PathBuf, String), BoxError> {
         self.records.push(record);
         if self.records.len() > self.max_records { let remove = self.records.len() - self.max_records; self.records.drain(..remove); }
         let value = json!({"records": self.records.iter().map(|item| json!({
@@ -303,7 +307,7 @@ impl UsageStore {
             "endpoint": item.endpoint, "status": item.status, "latency_ms": item.latency_ms,
             "input_tokens": item.input_tokens, "output_tokens": item.output_tokens,
         })).collect::<Vec<_>>()});
-        write_private(&self.path, &serde_json::to_string(&value)?).await
+        Ok((self.path.clone(), serde_json::to_string(&value)?))
     }
 
     fn summary(&self) -> Value {
@@ -330,7 +334,14 @@ fn usage_tokens(usage: Option<&Value>) -> (u64, u64) {
 async fn record_usage(state: &AppState, key_id: &str, model: &str, endpoint: &str, status: StatusCode, started: std::time::Instant, usage: Option<&Value>) {
     let (input_tokens, output_tokens) = usage_tokens(usage);
     let record = UsageRecord { timestamp: now(), key_id: key_id.to_string(), model: model.to_string(), endpoint: endpoint.to_string(), status: status.as_u16(), latency_ms: started.elapsed().as_millis() as u64, input_tokens, output_tokens };
-    if let Err(error) = state.usage.lock().await.record(record).await { eprintln!("usage record failed: {error}"); }
+    let snapshot = {
+        let mut store = state.usage.lock().await;
+        store.record(record)
+    };
+    match snapshot {
+        Ok((path, contents)) => if let Err(error) = write_private(&path, &contents).await { eprintln!("usage record failed: {error}"); },
+        Err(error) => eprintln!("usage record failed: {error}"),
+    }
 }
 
 
@@ -481,27 +492,46 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
         let raw_key = new_api_key();
         let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name: name.to_string(), key_hash: hash_key(&raw_key), created_at: now(), revoked: false };
         let public = ApiKeyStore::public_key(&record);
-        let mut store = state.api_keys.lock().await; store.keys.push(record);
-        if let Err(e) = store.save().await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).with_type("api_error").into_response(); }
+        let save_snapshot = {
+            let mut store = state.api_keys.lock().await;
+            store.keys.push(record);
+            store.serialized().map(|contents| (store.path.clone(), contents))
+        };
+        let (path, contents) = match save_snapshot { Ok(value) => value, Err(e) => return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot serialize API key: {e}")).with_type("api_error").into_response() };
+        if let Err(e) = write_private(&path, &contents).await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).with_type("api_error").into_response(); }
         return json_response(&Request::new(Body::empty()), &state.config, StatusCode::CREATED, json!({"key": raw_key, "data": public}));
     }
     let Some(key_id) = key_id else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
-    let mut store = state.api_keys.lock().await;
-    let Some(index) = store.keys.iter().position(|key| key.id == key_id) else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
     if action == "rotate" {
-        let name = store.keys[index].name.clone();
-        store.keys[index].revoked = true;
-        let raw_key = new_api_key();
-        let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name, key_hash: hash_key(&raw_key), created_at: now(), revoked: false };
-        let public = ApiKeyStore::public_key(&record);
-        store.keys.push(record);
-        if let Err(e) = store.save().await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).into_response(); }
+        let save_snapshot = {
+            let mut store = state.api_keys.lock().await;
+            let Some(index) = store.keys.iter().position(|key| key.id == key_id) else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
+            let name = store.keys[index].name.clone();
+            store.keys[index].revoked = true;
+            let raw_key = new_api_key();
+            let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name, key_hash: hash_key(&raw_key), created_at: now(), revoked: false };
+            let public = ApiKeyStore::public_key(&record);
+            store.keys.push(record);
+            let snapshot = store.serialized().map(|contents| (store.path.clone(), contents));
+            (raw_key, public, snapshot)
+        };
+        let (raw_key, public, snapshot) = save_snapshot;
+        let (path, contents) = match snapshot { Ok(value) => value, Err(e) => return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot serialize API key: {e}")).into_response() };
+        if let Err(e) = write_private(&path, &contents).await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).into_response(); }
         return json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, json!({"key": raw_key, "data": public}));
     }
     if action == "revoke" {
-        store.keys[index].revoked = true;
-        if let Err(e) = store.save().await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).into_response(); }
-        return json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, json!({"data": ApiKeyStore::public_key(&store.keys[index])}));
+        let save_snapshot = {
+            let mut store = state.api_keys.lock().await;
+            let Some(index) = store.keys.iter().position(|key| key.id == key_id) else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
+            store.keys[index].revoked = true;
+            let public = ApiKeyStore::public_key(&store.keys[index]);
+            store.serialized().map(|contents| (store.path.clone(), contents)).map(|snapshot| (public, snapshot))
+        };
+        let (public, snapshot) = match save_snapshot { Ok(value) => value, Err(e) => return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot serialize API key: {e}")).into_response() };
+        let (path, contents) = snapshot;
+        if let Err(e) = write_private(&path, &contents).await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).into_response(); }
+        return json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, json!({"data": public}));
     }
     GatewayError::new(StatusCode::NOT_FOUND, "unknown admin operation").into_response()
 }
