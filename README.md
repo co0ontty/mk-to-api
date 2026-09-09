@@ -39,7 +39,15 @@ node direct-gateway.mjs --model gpt-6-astra --prompt "Reply with OK only." --str
 
 The script reads the signed OhMyAgent key from MonkeyCode's application
 configuration and sends requests to the configured `/v1/responses` endpoint.
-The request uses the same mechanism as the Agent:
+The local gateway accepts both OpenAI Responses and Chat Completions routes:
+
+- `POST /v1/responses`
+- `POST /v1/chat/completions`
+
+Chat Completions requests are converted to the upstream Responses format and
+converted back to a non-streaming Chat Completion response. Query parameters
+and trailing slashes on these routes are accepted.
+
 
 - `Authorization: Bearer oma_...`
 - `X-OhMyAgent-Signature: v1=<HMAC-SHA256 hex>`

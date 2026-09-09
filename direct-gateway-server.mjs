@@ -83,6 +83,37 @@ function inputText(text) {
   return [{ type: 'input_text', text }];
 }
 
+function chatMessageText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (typeof part?.text === 'string') return part.text;
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function chatMessagesToInput(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages.map((message) => {
+    const role = message?.role === 'system' ? 'developer' : message?.role;
+    const text = chatMessageText(message?.content);
+    return {
+      role: role || 'user',
+      content: inputText(text),
+    };
+  });
+}
+
+function responseOutputText(data) {
+  if (typeof data?.output_text === 'string') return data.output_text;
+  return (data?.output || [])
+    .flatMap((item) => item?.content || [])
+    .filter((item) => item?.type === 'output_text' && typeof item.text === 'string')
+    .map((item) => item.text)
+    .join('');
+}
+
 function normalizeBody(body, model, developerPrompt) {
   const normalized = { ...body, model };
   const input = normalized.input;
@@ -144,6 +175,78 @@ async function loadRuntime(requestedModel) {
   };
 }
 
+async function handleChatCompletions(req, res) {
+  if (!authorized(req)) {
+    sendError(res, 401, 'invalid local gateway API key', 'authentication_error');
+    return;
+  }
+  let body;
+  try {
+    body = await readJson(req);
+  } catch (error) {
+    sendError(res, 400, error.message);
+    return;
+  }
+  const requestedModel = typeof body.model === 'string' && body.model ? body.model : 'gpt-6-astra';
+  let runtime;
+  try {
+    runtime = await loadRuntime(requestedModel);
+  } catch (error) {
+    sendError(res, 500, error.message, 'gateway_configuration_error');
+    return;
+  }
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const developerPrompt = promptFromRequest({ messages }) || 'You are a helpful assistant.';
+  const outgoingBody = {
+    ...body,
+    model: runtime.model,
+    input: chatMessagesToInput(messages),
+  };
+  delete outgoingBody.messages;
+  delete outgoingBody.stream;
+  const signature = crypto.createHmac('sha256', runtime.signingSecret).update(developerPrompt, 'utf8').digest('hex');
+  let upstream;
+  try {
+    upstream = await fetch(`${runtime.baseUrl}/responses`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${runtime.apiKey}`,
+        'X-OhMyAgent-Signature': `v1=${signature}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(outgoingBody),
+    });
+  } catch (error) {
+    sendError(res, 502, `gateway request failed: ${error.message}`, 'upstream_error');
+    return;
+  }
+  if (!upstream.ok) {
+    const detail = (await upstream.text()).slice(0, 2000);
+    sendError(res, upstream.status, detail, 'upstream_error');
+    return;
+  }
+  let data;
+  try {
+    data = await upstream.json();
+  } catch (error) {
+    sendError(res, 502, `invalid gateway response: ${error.message}`, 'upstream_error');
+    return;
+  }
+  sendJson(res, 200, {
+    id: data.id || `chatcmpl-${crypto.randomUUID()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: requestedModel,
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: responseOutputText(data) },
+      finish_reason: 'stop',
+    }],
+    usage: data.usage || undefined,
+  });
+}
+
 async function handleResponses(req, res) {
   if (!authorized(req)) {
     sendError(res, 401, 'invalid local gateway API key', 'authentication_error');
@@ -198,11 +301,13 @@ async function handleResponses(req, res) {
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.method === 'GET' && (req.url === '/health' || req.url === '/v1/health')) {
+    const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const pathname = requestUrl.pathname.replace(/\/+$/, '') || '/';
+    if (req.method === 'GET' && (pathname === '/health' || pathname === '/v1/health')) {
       sendJson(res, 200, { ok: true, mode: 'direct-signed-gateway', endpoint: 'proxy.monkeycode-ai.com/v1' });
       return;
     }
-    if (req.method === 'GET' && (req.url === '/models' || req.url === '/v1/models')) {
+    if (req.method === 'GET' && (pathname === '/models' || pathname === '/v1/models')) {
       if (!authorized(req)) {
         sendError(res, 401, 'invalid local gateway API key', 'authentication_error');
         return;
@@ -212,8 +317,12 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { object: 'list', data: ids.map((id) => ({ id, object: 'model', owned_by: 'monkeycode' })) });
       return;
     }
-    if (req.method === 'POST' && (req.url === '/responses' || req.url === '/v1/responses')) {
+    if (req.method === 'POST' && (pathname === '/responses' || pathname === '/v1/responses')) {
       await handleResponses(req, res);
+      return;
+    }
+    if (req.method === 'POST' && (pathname === '/chat/completions' || pathname === '/v1/chat/completions')) {
+      await handleChatCompletions(req, res);
       return;
     }
     sendError(res, 404, 'not found');
