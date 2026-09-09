@@ -155,8 +155,8 @@ impl Config {
         let api_keys_path = configured_path(args, &file, "api-keys-file", "DIRECT_GATEWAY_API_KEYS_FILE", config_dir.join("api-keys.json"));
         let usage_path = configured_path(args, &file, "usage-file", "DIRECT_GATEWAY_USAGE_FILE", config_dir.join("usage.json"));
         let admin_key_path = configured_path(args, &file, "admin-key-file", "DIRECT_GATEWAY_ADMIN_KEY_FILE", config_dir.join("admin.key"));
-        let host = configured(args, &file, "host", "DIRECT_GATEWAY_HOST", std::env::var("OHMYAGENT_BRIDGE_HOST").unwrap_or_else(|_| "0.0.0.0"));
-        let port = parse_u16(&configured(args, &file, "port", "DIRECT_GATEWAY_PORT", std::env::var("OHMYAGENT_BRIDGE_PORT").unwrap_or_else(|_| "8123")), "port")?;
+        let host = configured(args, &file, "host", "DIRECT_GATEWAY_HOST", std::env::var("OHMYAGENT_BRIDGE_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()));
+        let port = parse_u16(&configured(args, &file, "port", "DIRECT_GATEWAY_PORT", std::env::var("OHMYAGENT_BRIDGE_PORT").unwrap_or_else(|_| "8123".to_string())), "port")?;
         let local_key = configured(args, &file, "key", "DIRECT_GATEWAY_KEY", std::env::var("OHMYAGENT_BRIDGE_KEY").unwrap_or_default());
         let auth_required = parse_bool(&configured(args, &file, "auth-required", "DIRECT_GATEWAY_AUTH_REQUIRED", "true".into()), true);
         let trust_proxy = parse_bool(&configured(args, &file, "trust-proxy", "DIRECT_GATEWAY_TRUST_PROXY", "false".into()), false);
@@ -783,7 +783,7 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
     let data = match upstream.json::<Value>().await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::BAD_GATEWAY, started, None).await; return GatewayError::new(StatusCode::BAD_GATEWAY, format!("invalid upstream response: {e}")).with_type("api_error").with_code("invalid_upstream_response").into_response(); } };
     record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::OK, started, data.get("usage")).await;
     let response_id = data.get("id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4()));
-    json!({"id": response_id, "object": "chat.completion", "created": now(), "model": requested_model, "choices": [{"index": 0, "message": {"role": "assistant", "content": response_output_text(&data)}, "finish_reason": response_finish_reason(Some(&data))}], "usage": normalized_usage(data.get("usage"))}).into_response()
+    axum::Json(json!({"id": response_id, "object": "chat.completion", "created": now(), "model": requested_model, "choices": [{"index": 0, "message": {"role": "assistant", "content": response_output_text(&data)}, "finish_reason": response_finish_reason(Some(&data))}], "usage": normalized_usage(data.get("usage"))})).into_response()
 }
 
 async fn handle_responses(request: Request<Body>, state: AppState, key_id: String) -> Response {
@@ -796,7 +796,7 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     if !upstream.status().is_success() { let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY); let error = upstream_error(upstream).await; record_usage(&state, &key_id, &requested_model, "responses", status, started, None).await; return error.into_response(); }
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) { let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx); tokio::spawn(stream_responses(upstream, tx, state, key_id, requested_model, started)); return response; }
     match upstream.json::<Value>().await {
-        Ok(data) => { record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, data.get("usage")).await; data.into_response() },
+        Ok(data) => { record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, data.get("usage")).await; axum::Json(data).into_response() },
         Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", StatusCode::BAD_GATEWAY, started, None).await; GatewayError::new(StatusCode::BAD_GATEWAY, format!("invalid upstream response: {e}")).with_type("api_error").with_code("invalid_upstream_response").into_response() }
     }
 }
@@ -807,7 +807,7 @@ async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response
     json_response(&request, &state.config, StatusCode::OK, usage.summary())
 }
 async fn listener(ConnectInfo(remote): ConnectInfo<SocketAddr>, State(state): State<AppState>, request: Request<Body>) -> Response {
-    let path = request.uri().path().trim_end_matches('/'); let path = if path.is_empty() { "/" } else { path };
+    let path = request.uri().path().trim_end_matches('/').to_string(); let path = if path.is_empty() { "/".to_string() } else { path };
     if !ip_allowed(&request, &state.config, remote) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "client IP is not allowed").with_type("permission_error").with_code("ip_not_allowed")); }
     if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !origin_allowed(&state.config, origin) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "request origin is not allowed").with_type("permission_error").with_code("origin_not_allowed")); }
