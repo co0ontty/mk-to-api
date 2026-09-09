@@ -442,8 +442,11 @@ async fn authenticated_key_id(request: &Request<Body>, state: &AppState) -> Opti
     if !state.config.local_key.is_empty() && safe_equal(bearer_token(request), &state.config.local_key) { return Some("legacy".into()); }
     let token = bearer_token(request)?;
     let hash = hash_key(token);
-    let store = state.api_keys.lock().await;
-    store.keys.iter().find(|key| !key.revoked && safe_equal(Some(hash.as_str()), key.key_hash.as_str())).map(|key| key.id.clone())
+    let keys = {
+        let store = state.api_keys.lock().await;
+        store.keys.iter().find(|key| !key.revoked && safe_equal(Some(hash.as_str()), key.key_hash.as_str())).map(|key| key.id.clone())
+    };
+    keys
 }
 
 fn admin_authorized(request: &Request<Body>, state: &AppState) -> bool {
@@ -482,8 +485,11 @@ function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
 async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Option<&str>, action: &str) -> Response {
     if !admin_authorized(&request, &state) { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key")); }
     if action == "list" {
-        let store = state.api_keys.lock().await;
-        return json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": store.keys.iter().map(ApiKeyStore::public_key).collect::<Vec<_>>() }));
+        let keys = {
+            let store = state.api_keys.lock().await;
+            store.keys.iter().map(ApiKeyStore::public_key).collect::<Vec<_>>()
+        };
+        return json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": keys}));
     }
     if action == "create" {
         let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => return e.into_response() };
@@ -833,8 +839,11 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
 
 async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response {
     if !admin_authorized(&request, &state) { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key")); }
-    let usage = state.usage.lock().await;
-    json_response(&request, &state.config, StatusCode::OK, usage.summary())
+    let summary = {
+        let usage = state.usage.lock().await;
+        usage.summary()
+    };
+    json_response(&request, &state.config, StatusCode::OK, summary)
 }
 #[axum::debug_handler]
 async fn listener(State(state): State<AppState>, request: Request<Body>) -> Response {
