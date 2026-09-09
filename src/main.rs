@@ -385,9 +385,11 @@ fn origin_allowed(state: &Config, origin: &str) -> bool { state.allowed_origins.
 
 fn cors_headers(request: &Request<Body>, state: &Config) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) && origin_allowed(state, origin) {
-        if let Ok(value) = HeaderValue::from_str(origin) { headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value); }
-        headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if origin_allowed(state, origin) {
+            if let Ok(value) = HeaderValue::from_str(origin) { headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value); }
+            headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+        }
     }
     headers
 }
@@ -533,7 +535,9 @@ fn text_from_content(content: Option<&Value>) -> String {
 }
 
 fn developer_prompt(body: &Value) -> String {
-    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) && !instructions.is_empty() { return instructions.to_string(); }
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        if !instructions.is_empty() { return instructions.to_string(); }
+    }
     for collection_name in ["messages", "input"] {
         if let Some(Value::Array(collection)) = body.get(collection_name) {
             let texts: Vec<_> = collection.iter().filter(|item| matches!(item.get("role").and_then(Value::as_str), Some("system") | Some("developer"))).map(|item| text_from_content(item.get("content").or_else(|| item.get("text")))).filter(|v| !v.is_empty()).collect();
@@ -806,7 +810,9 @@ async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response
 
     let path = request.uri().path().trim_end_matches('/'); let path = if path.is_empty() { "/" } else { path };
     if !ip_allowed(&request, &state.config, remote) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "client IP is not allowed").with_type("permission_error").with_code("ip_not_allowed")); }
-    if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) && !origin_allowed(&state.config, origin) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "request origin is not allowed").with_type("permission_error").with_code("origin_not_allowed")); }
+    if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if !origin_allowed(&state.config, origin) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "request origin is not allowed").with_type("permission_error").with_code("origin_not_allowed")); }
+    }
     if request.method() == axum::http::Method::OPTIONS { let mut response = StatusCode::NO_CONTENT.into_response(); response.headers_mut().extend(cors_headers(&request, &state.config)); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS")); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Authorization, Content-Type")); response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400")); return response; }
     if request.method() == axum::http::Method::GET && (path == "/" || path == "/v1") { return json_response(&request, &state.config, StatusCode::OK, json!({"object": "gateway", "name": "monkeycode-direct-gateway", "status": "ok", "endpoints": ["/health", "/v1/models", "/v1/responses", "/v1/chat/completions"]})); }
     if request.method() == axum::http::Method::GET && (path == "/health" || path == "/v1/health") { return json_response(&request, &state.config, StatusCode::OK, json!({"ok": true, "mode": "direct-signed-gateway", "auth_required": state.config.auth_required, "tls": state.config.tls_cert.is_some()})); }
