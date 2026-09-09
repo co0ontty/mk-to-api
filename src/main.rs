@@ -845,8 +845,7 @@ async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response
     };
     json_response(&request, &state.config, StatusCode::OK, summary)
 }
-#[axum::debug_handler]
-async fn listener(State(state): State<AppState>, request: Request<Body>) -> Response {
+async fn listener(state: AppState, request: Request<Body>) -> Response {
     let remote = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0).unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let path = request.uri().path().trim_end_matches('/').to_string(); let path = if path.is_empty() { "/".to_string() } else { path };
     if !ip_allowed(&request, &state.config, remote) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "client IP is not allowed").with_type("permission_error").with_code("ip_not_allowed")); }
@@ -889,7 +888,12 @@ async fn main() -> Result<(), BoxError> {
     let api_keys = ApiKeyStore::load(config.api_keys_path.clone()).await?;
     let usage = UsageStore::load(config.usage_path.clone(), config.max_usage_records).await?;
     let state = AppState { config: config.clone(), client, admin_key: Arc::new(admin_key), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)) };
-    let app = Router::new().fallback(listener).with_state(state);
+    let state_for_fallback = state.clone();
+    let fallback = tower::service_fn(move |request: Request<Body>| {
+        let state = state_for_fallback.clone();
+        async move { Ok::<Response, Infallible>(listener(state, request).await) }
+    });
+    let app = Router::new().fallback_service(fallback);
     let mut addresses = tokio::net::lookup_host(format!("{}:{}", config.host, config.port)).await.map_err(|e| boxed(format!("invalid listen address: {}:{} ({e})", config.host, config.port)))?;
     let address = addresses.next().ok_or_else(|| boxed(format!("cannot resolve listen address: {}:{}", config.host, config.port)))?;
     if let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) {
