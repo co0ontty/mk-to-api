@@ -1,16 +1,15 @@
 [package]
-name = "monkeycode-direct-gateway"
+name = "mk2api"
 version = "0.1.0"
 edition = "2021"
 description = "OpenAI-compatible signed forwarding gateway for MonkeyCode"
 
 [dependencies]
-axum = { version = "0.7", features = ["macros"] }
+axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
-http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,3 +18,7 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "mk2api"
+path = "src/main.rs"

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{ConnectInfo},
@@ -21,6 +23,10 @@ use std::{
 use tokio::{net::TcpListener, sync::{mpsc, Mutex}, time::Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
+
+mod anthropic;
+mod cli;
+mod clients;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -49,6 +55,9 @@ struct Config {
     upstream_host: Option<String>,
     upstream_key: Option<String>,
     signing_secret: Option<String>,
+    manage_clients: bool,
+    manage_pi: bool,
+    manage_codex: bool,
 }
 
 #[derive(Clone)]
@@ -138,20 +147,22 @@ impl IntoResponse for GatewayError {
 impl Config {
     async fn load(args: &[String]) -> Result<Self, BoxError> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let default_dir = PathBuf::from(home).join("Library/Application Support/com.chaitin.baizhi.monkeycode");
+        let legacy_dir = PathBuf::from(&home).join("Library/Application Support/com.chaitin.baizhi.monkeycode");
+        let default_dir = std::env::var("MK2API_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(&home).join(".mk2api"));
         let config_path = flag(args, "--config")
+            .or_else(|| std::env::var("MK2API_CONFIG").ok())
             .or_else(|| std::env::var("MONKEYCODE_GATEWAY_CONFIG").ok())
             .map(PathBuf::from)
-            .unwrap_or_else(|| default_dir.join("direct-gateway.json"));
+            .unwrap_or_else(|| default_dir.join("config.json"));
         let file = match tokio::fs::read_to_string(&config_path).await {
             Ok(text) => serde_json::from_str::<Value>(&text).map_err(|e| boxed(format!("cannot read gateway config: {} ({e})", config_path.display())))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
             Err(e) => return Err(boxed(format!("cannot read gateway config: {} ({e})", config_path.display()))),
         };
 
-        let config_dir = configured_path(args, &file, "config-dir", "MONKEYCODE_CONFIG_DIR", default_dir.clone());
-        let key_path = configured_path(args, &file, "key-file", "MONKEYCODE_OHMYAGENT_KEY", config_dir.join("monkeycode-ohmyagent-key.json"));
-        let settings_path = configured_path(args, &file, "settings", "OHMYAGENT_SETTINGS", config_dir.join("ohmyagent/settings.json"));
+        let config_dir = configured_path(args, &file, "config-dir", "MK2API_HOME", default_dir.clone());
+        let key_path = configured_path(args, &file, "key-file", "MONKEYCODE_OHMYAGENT_KEY", legacy_dir.join("monkeycode-ohmyagent-key.json"));
+        let settings_path = configured_path(args, &file, "settings", "OHMYAGENT_SETTINGS", legacy_dir.join("ohmyagent/settings.json"));
         let api_keys_path = configured_path(args, &file, "api-keys-file", "DIRECT_GATEWAY_API_KEYS_FILE", config_dir.join("api-keys.json"));
         let usage_path = configured_path(args, &file, "usage-file", "DIRECT_GATEWAY_USAGE_FILE", config_dir.join("usage.json"));
         let admin_key_path = configured_path(args, &file, "admin-key-file", "DIRECT_GATEWAY_ADMIN_KEY_FILE", config_dir.join("admin.key"));
@@ -197,6 +208,9 @@ impl Config {
             upstream_host: configured_optional(args, &file, "upstream-host", "DIRECT_GATEWAY_UPSTREAM_HOST"),
             upstream_key: configured_optional(args, &file, "upstream-key", "DIRECT_GATEWAY_UPSTREAM_KEY"),
             signing_secret: configured_optional(args, &file, "signing-secret", "DIRECT_GATEWAY_SIGNING_SECRET"),
+            manage_clients: parse_bool(&configured(args, &file, "manage-clients", "MK2API_MANAGE_CLIENTS", "true".into()), true),
+            manage_pi: parse_bool(&configured(args, &file, "manage-pi", "MK2API_MANAGE_PI", "true".into()), true),
+            manage_codex: parse_bool(&configured(args, &file, "manage-codex", "MK2API_MANAGE_CODEX", "true".into()), true),
         })
     }
 }
@@ -265,15 +279,9 @@ impl ApiKeyStore {
         Ok(serde_json::to_string_pretty(&value)?)
     }
 
-    async fn save(&self) -> Result<(), BoxError> {
-        write_private(&self.path, &self.serialized()?).await
-    }
-
     fn public_key(key: &ApiKeyRecord) -> Value {
         json!({"id": key.id, "name": key.name, "created_at": key.created_at, "revoked": key.revoked})
     }
-
-    fn find(&self, id: &str) -> Option<&ApiKeyRecord> { self.keys.iter().find(|key| key.id == id) }
 }
 
 impl UsageStore {
@@ -326,7 +334,7 @@ impl UsageStore {
     }
 }
 
-fn usage_tokens(usage: Option<&Value>) -> (u64, u64) {
+pub(crate) fn usage_tokens(usage: Option<&Value>) -> (u64, u64) {
     let Some(usage) = usage else { return (0, 0); };
     (usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0), usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0))
 }
@@ -431,10 +439,6 @@ fn safe_equal(left: Option<&str>, right: &str) -> bool {
     let Some(left) = left else { return false; };
     let a = left.as_bytes(); let b = right.as_bytes();
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn legacy_authorized(request: &Request<Body>, config: &Config) -> bool {
-    !config.auth_required || (!config.local_key.is_empty() && safe_equal(bearer_token(request), &config.local_key))
 }
 
 async fn authenticated_key_id(token: Option<String>, state: &AppState) -> Option<String> {
@@ -575,6 +579,8 @@ fn developer_prompt(body: &Value) -> String {
     if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
         if !instructions.is_empty() { return instructions.to_string(); }
     }
+    let system = anthropic::system_text(body.get("system"));
+    if !system.is_empty() { return system; }
     for collection_name in ["messages", "input"] {
         if let Some(Value::Array(collection)) = body.get(collection_name) {
             let texts: Vec<_> = collection.iter().filter(|item| matches!(item.get("role").and_then(Value::as_str), Some("system") | Some("developer"))).map(|item| text_from_content(item.get("content").or_else(|| item.get("text")))).filter(|v| !v.is_empty()).collect();
@@ -584,19 +590,27 @@ fn developer_prompt(body: &Value) -> String {
     "You are a helpful assistant.".to_string()
 }
 
-fn input_content(content: Option<&Value>) -> Value {
+fn input_content(content: Option<&Value>, role: &str) -> Value {
+    let text_type = if role == "assistant" { "output_text" } else { "input_text" };
     let parts = match content {
-        Some(Value::String(value)) => vec![json!({"type": "input_text", "text": value})],
+        Some(Value::String(value)) => vec![json!({"type": text_type, "text": value})],
         Some(Value::Array(values)) => values.iter().filter_map(|part| match part {
-            Value::String(value) => Some(json!({"type": "input_text", "text": value})),
-            Value::Object(map) if matches!(map.get("type").and_then(Value::as_str), Some("text") | Some("input_text")) => Some(json!({"type": "input_text", "text": map.get("text").and_then(Value::as_str).unwrap_or("")})),
-            Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("image_url") => map.get("image_url").and_then(|v| v.get("url")).and_then(Value::as_str).map(|url| json!({"type": "input_image", "image_url": url, "detail": map.get("image_url").and_then(|v| v.get("detail")).and_then(Value::as_str).unwrap_or("auto")})),
-            Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("input_image") => Some(Value::Object(map.clone())),
+            Value::String(value) => Some(json!({"type": text_type, "text": value})),
+            Value::Object(map) if map.get("type").and_then(Value::as_str) == Some("refusal") => {
+                if role == "assistant" {
+                    Some(json!({"type": "refusal", "refusal": map.get("refusal").or_else(|| map.get("text")).and_then(Value::as_str).unwrap_or("")}))
+                } else {
+                    Some(json!({"type": text_type, "text": map.get("refusal").or_else(|| map.get("text")).and_then(Value::as_str).unwrap_or("")}))
+                }
+            }
+            Value::Object(map) if matches!(map.get("type").and_then(Value::as_str), Some("text") | Some("input_text") | Some("output_text")) => Some(json!({"type": text_type, "text": map.get("text").and_then(Value::as_str).unwrap_or("")})),
+            Value::Object(map) if role != "assistant" && map.get("type").and_then(Value::as_str) == Some("image_url") => map.get("image_url").and_then(|v| v.get("url")).and_then(Value::as_str).map(|url| json!({"type": "input_image", "image_url": url, "detail": map.get("image_url").and_then(|v| v.get("detail")).and_then(Value::as_str).unwrap_or("auto")})),
+            Value::Object(map) if role != "assistant" && map.get("type").and_then(Value::as_str) == Some("input_image") => Some(Value::Object(map.clone())),
             _ => None,
         }).collect::<Vec<_>>(),
         _ => Vec::new(),
     };
-    Value::Array(if parts.is_empty() { vec![json!({"type": "input_text", "text": ""})] } else { parts })
+    Value::Array(if parts.is_empty() { vec![json!({"type": text_type, "text": ""})] } else { parts })
 }
 
 fn messages_to_input(messages: Option<&Value>) -> Value {
@@ -605,21 +619,23 @@ fn messages_to_input(messages: Option<&Value>) -> Value {
         let map = message.as_object()?;
         let role = map.get("role")?.as_str()?;
         if !["system", "developer", "user", "assistant"].contains(&role) { return None; }
-        Some(json!({"role": if role == "system" { "developer" } else { role }, "content": input_content(map.get("content"))}))
+        let normalized_role = if role == "system" { "developer" } else { role };
+        Some(json!({"role": normalized_role, "content": input_content(map.get("content"), normalized_role)}))
     }).collect())
 }
 
 fn normalize_response_input(input: Option<&Value>) -> Value {
     match input {
-        Some(Value::String(value)) => Value::Array(vec![json!({"role": "user", "content": input_content(Some(&Value::String(value.clone())))} )]),
+        Some(Value::String(value)) => Value::Array(vec![json!({"role": "user", "content": input_content(Some(&Value::String(value.clone())), "user")} )]),
         Some(Value::Array(items)) => Value::Array(items.iter().map(|item| {
-            if item.is_string() { return json!({"role": "user", "content": input_content(Some(item))}); }
+            if item.is_string() { return json!({"role": "user", "content": input_content(Some(item), "user")}); }
             let mut map = item.as_object().cloned().unwrap_or_default();
             if map.get("type").and_then(Value::as_str).is_some_and(|v| v != "message") { return Value::Object(map); }
-            let role = map.get("role").and_then(Value::as_str).unwrap_or("user").to_string();
-            map.insert("role".into(), Value::String(if role == "system" { "developer".into() } else { role }));
+            let role = map.get("role").and_then(Value::as_str).unwrap_or("user");
+            let normalized_role = if role == "system" { "developer" } else { role }.to_string();
+            map.insert("role".into(), Value::String(normalized_role.clone()));
             let content = map.remove("content").or_else(|| map.remove("text")).unwrap_or(Value::String(String::new()));
-            map.insert("content".into(), input_content(Some(&content)));
+            map.insert("content".into(), input_content(Some(&content), &normalized_role));
             Value::Object(map)
         }).collect()),
         _ => Value::Array(Vec::new()),
@@ -631,7 +647,12 @@ fn normalize_chat_request(body: &Value, model: &str) -> Result<Value, GatewayErr
     if messages.is_empty() { return Err(GatewayError::new(StatusCode::BAD_REQUEST, "messages must be a non-empty array")); }
     let mut outgoing = Map::new();
     outgoing.insert("model".into(), Value::String(model.into()));
-    outgoing.insert("input".into(), messages_to_input(body.get("messages")));
+    let mut input = messages_to_input(body.get("messages"));
+    if !input.as_array().is_some_and(|items| items.iter().any(|item| item.get("role").and_then(Value::as_str) == Some("developer"))) {
+        let prompt = developer_prompt(body);
+        input.as_array_mut().unwrap().insert(0, json!({"role": "developer", "content": input_content(Some(&Value::String(prompt)), "developer")}));
+    }
+    outgoing.insert("input".into(), input);
     outgoing.insert("stream".into(), json!(body.get("stream").and_then(Value::as_bool).unwrap_or(false)));
     outgoing.insert("store".into(), body.get("store").cloned().unwrap_or(json!(false)));
     if let Some(value) = body.get("max_completion_tokens").filter(|v| !v.is_null()).or_else(|| body.get("max_tokens").filter(|v| !v.is_null())) { outgoing.insert("max_output_tokens".into(), value.clone()); }
@@ -645,7 +666,7 @@ fn normalize_responses_request(body: &Value, model: &str, prompt: &str) -> Value
     let mut input = normalize_response_input(body.get("input"));
     if matches!(input, Value::Array(ref values) if values.is_empty()) { input = messages_to_input(body.get("messages")); }
     if !input.as_array().is_some_and(|items| items.iter().any(|item| item.get("role").and_then(Value::as_str) == Some("developer"))) {
-        input.as_array_mut().unwrap().insert(0, json!({"role": "developer", "content": input_content(Some(&Value::String(prompt.into())))}));
+        input.as_array_mut().unwrap().insert(0, json!({"role": "developer", "content": input_content(Some(&Value::String(prompt.into())), "developer")}));
     }
     outgoing.insert("input".into(), input);
     outgoing.insert("store".into(), body.get("store").cloned().unwrap_or(json!(false)));
@@ -658,7 +679,40 @@ async fn json_file(path: &Path, label: &str) -> Result<Value, GatewayError> {
     serde_json::from_str(&text).map_err(|e| GatewayError::config(format!("cannot parse {label}: {} ({e})", path.display())))
 }
 
-struct Runtime { base_url: String, api_key: String, model: String, signing_secret: String, model_ids: Vec<String> }
+struct Runtime {
+    base_url: String,
+    api_key: String,
+    model: String,
+    signing_secret: String,
+    anthropic: bool,
+    max_output: u64,
+}
+
+fn same_url(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+fn resolve_model<'a>(models: &'a [Value], requested_model: &str) -> Option<&'a Value> {
+    if requested_model.contains('/') {
+        return models.iter().find(|entry| entry.get("model").and_then(Value::as_str) == Some(requested_model));
+    }
+    for prefix in ["monkeycode-basic/", "monkeycode-pro/", "monkeycode-ultra/"] {
+        let candidate = format!("{prefix}{requested_model}");
+        if let Some(found) = models.iter().find(|entry| entry.get("model").and_then(Value::as_str) == Some(candidate.as_str())) {
+            return Some(found);
+        }
+    }
+    models.iter().find(|entry| entry.get("model").and_then(Value::as_str) == Some(requested_model))
+}
+
+fn models_for_upstream(settings: &Value, base_url: &str) -> Vec<Value> {
+    settings.get("models").and_then(Value::as_object).into_iter().flat_map(|models| models.values().cloned()).filter(|entry| {
+        match entry.get("base_url").and_then(Value::as_str) {
+            Some(url) => same_url(url, base_url),
+            None => true,
+        }
+    }).collect()
+}
 
 async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime, GatewayError> {
     let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
@@ -666,21 +720,27 @@ async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime,
     let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
     let upstream_key = config.upstream_key.clone().or_else(|| key_config.get("api_key").and_then(Value::as_str).map(str::to_string));
     let signing_secret = config.signing_secret.clone().or_else(|| key_config.get("signing_secret").and_then(Value::as_str).map(str::to_string));
-    let models = settings.get("models").and_then(Value::as_object).cloned().unwrap_or_default();
-    let normalized = if requested_model.contains('/') { requested_model.to_string() } else { format!("monkeycode-ultra/{requested_model}") };
-    let model_config = models.values().find(|entry| entry.get("model").and_then(Value::as_str) == Some(requested_model) || entry.get("model").and_then(Value::as_str) == Some(normalized.as_str()));
     if base_url.is_empty() || upstream_key.as_deref().unwrap_or("").is_empty() || signing_secret.as_deref().unwrap_or("").is_empty() { return Err(GatewayError::config("gateway configuration is missing upstream_host, upstream_key, or signing_secret")); }
-    let Some(model_config) = model_config else { return Err(GatewayError::new(StatusCode::NOT_FOUND, format!("model is not configured: {requested_model}")).with_code("model_not_found")); };
-    let model = model_config.get("model").and_then(Value::as_str).unwrap_or(normalized.as_str()).to_string();
+    let models = models_for_upstream(&settings, &base_url);
+    let Some(model_config) = resolve_model(&models, requested_model) else { return Err(GatewayError::new(StatusCode::NOT_FOUND, format!("model is not configured: {requested_model}")).with_code("model_not_found")); };
+    let model = model_config.get("model").and_then(Value::as_str).unwrap_or(requested_model).to_string();
     let api_key = model_config.get("api_key").and_then(Value::as_str).unwrap_or(upstream_key.as_deref().unwrap()).to_string();
-    Ok(Runtime { base_url, api_key, model, signing_secret: signing_secret.unwrap(), model_ids: models.values().filter_map(|v| v.get("model").and_then(Value::as_str).map(str::to_string)).collect() })
+    Ok(Runtime {
+        base_url,
+        api_key,
+        model,
+        signing_secret: signing_secret.unwrap(),
+        anthropic: anthropic::is_anthropic_type(model_config.get("type").and_then(Value::as_str)),
+        max_output: model_config.get("max_output").and_then(Value::as_u64).unwrap_or(32_000),
+    })
 }
 
 async fn configured_model_ids(config: &Config) -> Result<Vec<String>, GatewayError> {
-    let settings = json_file(&config.settings_path, "OhMyAgent settings").await?;
-    let models = settings.get("models").and_then(Value::as_object).cloned().unwrap_or_default();
+    let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
+    let key_config = key_config?; let settings = settings?;
+    let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
     let mut ids = Vec::new();
-    for id in models.values().filter_map(|entry| entry.get("model").and_then(Value::as_str)) {
+    for id in models_for_upstream(&settings, &base_url).iter().filter_map(|entry| entry.get("model").and_then(Value::as_str)) {
         let id = id.to_string();
         if !ids.contains(&id) { ids.push(id.clone()); }
         let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1);
@@ -694,12 +754,16 @@ async fn request_upstream(state: &AppState, outgoing: &Value, runtime: &Runtime)
     let mut signer = HmacSha256::new_from_slice(runtime.signing_secret.as_bytes()).map_err(|_| GatewayError::config("invalid signing_secret"))?;
     signer.update(prompt.as_bytes());
     let signature = hex::encode(signer.finalize().into_bytes());
-    state.client.post(format!("{}/responses", runtime.base_url))
+    let path = if runtime.anthropic { "messages" } else { "responses" };
+    let mut request = state.client.post(format!("{}/{path}", runtime.base_url))
         .header(header::AUTHORIZATION, format!("Bearer {}", runtime.api_key))
         .header("X-OhMyAgent-Signature", format!("v1={signature}"))
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, if outgoing.get("stream").and_then(Value::as_bool).unwrap_or(false) { "text/event-stream" } else { "application/json" })
-        .json(outgoing).send().await.map_err(|e| GatewayError::new(StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).with_type("api_error").with_code("upstream_unavailable"))
+        .header(header::ACCEPT, if outgoing.get("stream").and_then(Value::as_bool).unwrap_or(false) { "text/event-stream" } else { "application/json" });
+    if runtime.anthropic {
+        request = request.header("anthropic-version", anthropic::anthropic_version());
+    }
+    request.json(outgoing).send().await.map_err(|e| GatewayError::new(StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).with_type("api_error").with_code("upstream_unavailable"))
 }
 
 async fn upstream_error(response: reqwest::Response) -> GatewayError {
@@ -725,7 +789,7 @@ fn response_finish_reason(data: Option<&Value>) -> &'static str {
     if data.and_then(|v| v.get("status")).and_then(Value::as_str) == Some("incomplete") && data.and_then(|v| v.get("incomplete_details")).and_then(|v| v.get("reason")).and_then(Value::as_str) == Some("max_output_tokens") { "length" } else { "stop" }
 }
 
-fn normalized_usage(usage: Option<&Value>) -> Option<Value> {
+pub(crate) fn normalized_usage(usage: Option<&Value>) -> Option<Value> {
     let usage = usage?;
     let prompt = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0);
     let completion = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0);
@@ -744,16 +808,20 @@ fn sse_response(cors: HeaderMap, rx: mpsc::Receiver<Result<Bytes, Infallible>>) 
     response
 }
 
-async fn send_sse(tx: &mpsc::Sender<Result<Bytes, Infallible>>, event: Option<&str>, data: &str) -> bool {
+pub(crate) async fn send_sse(tx: &mpsc::Sender<Result<Bytes, Infallible>>, event: Option<&str>, data: &str) -> bool {
     let mut output = String::new();
     if let Some(event) = event { output.push_str("event: "); output.push_str(event); output.push('\n'); }
     output.push_str("data: "); output.push_str(data); output.push_str("\n\n");
     tx.send(Ok(Bytes::from(output))).await.is_ok()
 }
 
-fn sse_block(block: &str) -> (String, String) {
+pub(crate) fn sse_block(block: &str) -> (String, String) {
     let mut event = String::new(); let mut data = Vec::new();
-    for line in block.lines() { if let Some(value) = line.strip_prefix("event:") { event = value.trim().to_string(); } else if let Some(value) = line.strip_prefix("data:") { data.push(value.strip_prefix(' ').unwrap_or(value).to_string()); } }
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(value) = line.strip_prefix("event:") { event = value.trim().to_string(); }
+        else if let Some(value) = line.strip_prefix("data:") { data.push(value.strip_prefix(' ').unwrap_or(value).trim_end_matches('\r').to_string()); }
+    }
     (event, data.join("\n"))
 }
 
@@ -767,7 +835,7 @@ async fn stream_chat(upstream: reqwest::Response, tx: mpsc::Sender<Result<Bytes,
     if !send_sse(&tx, None, &chunk(json!({"role": "assistant", "content": ""}), None, None).to_string()).await { return; }
     let mut stream = upstream.bytes_stream(); let mut buffer = String::new(); let mut completed = None;
     while let Some(result) = stream.next().await {
-        let Ok(bytes) = result else { break; }; buffer.push_str(&String::from_utf8_lossy(&bytes));
+        let Ok(bytes) = result else { break; }; buffer.push_str(&String::from_utf8_lossy(&bytes)); buffer = buffer.replace("\r\n", "\n");
         while let Some(index) = buffer.find("\n\n") {
             let block = buffer[..index].to_string(); buffer = buffer[index + 2..].to_string();
             let (_, data) = sse_block(&block); if data.is_empty() || data == "[DONE]" { continue; }
@@ -792,7 +860,7 @@ async fn stream_responses(upstream: reqwest::Response, tx: mpsc::Sender<Result<B
         let mut stream = upstream.bytes_stream(); let mut buffer = String::new(); let mut usage = None;
         while let Some(result) = stream.next().await {
             let Ok(bytes) = result else { break; };
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.push_str(&String::from_utf8_lossy(&bytes)); buffer = buffer.replace("\r\n", "\n");
             if tx.send(Ok(bytes)).await.is_err() { return; }
             while let Some(index) = buffer.find("\n\n") {
                 let block = buffer[..index].to_string(); buffer = buffer[index + 2..].to_string();
@@ -819,18 +887,40 @@ async fn stream_responses(upstream: reqwest::Response, tx: mpsc::Sender<Result<B
     record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, usage.as_ref()).await;
 }
 
-fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
+pub(crate) fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() }
 
 async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) -> Response {
     let started = std::time::Instant::now(); let cors = cors_headers(&request, &state.config);
     let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, "unknown", "chat.completions", e.status, started, None).await; return e.into_response(); } };
     let requested_model = body.get("model").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or("gpt-6-astra").to_string();
     let runtime = match load_runtime(&state.config, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
-    let outgoing = match normalize_chat_request(&body, &runtime.model) { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
+    let outgoing = if runtime.anthropic {
+        anthropic::to_anthropic_request(&body, &runtime.model, runtime.max_output)
+    } else {
+        match normalize_chat_request(&body, &runtime.model) { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } }
+    };
     let upstream = match request_upstream(&state, &outgoing, &runtime).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
     if !upstream.status().is_success() { let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY); let error = upstream_error(upstream).await; record_usage(&state, &key_id, &requested_model, "chat.completions", status, started, None).await; return error.into_response(); }
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) { let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx); tokio::spawn(stream_chat(upstream, tx, requested_model, state, key_id, started)); return response; }
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx);
+        if runtime.anthropic {
+            let model = requested_model.clone();
+            tokio::spawn(async move {
+                if let Some(completed) = anthropic::stream_as_chat(upstream, tx, model.clone()).await {
+                    record_usage(&state, &key_id, &model, "chat.completions", StatusCode::OK, started, completed.get("usage")).await;
+                }
+            });
+        } else {
+            tokio::spawn(stream_chat(upstream, tx, requested_model, state, key_id, started));
+        }
+        return response;
+    }
     let data = match upstream.json::<Value>().await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::BAD_GATEWAY, started, None).await; return GatewayError::new(StatusCode::BAD_GATEWAY, format!("invalid upstream response: {e}")).with_type("api_error").with_code("invalid_upstream_response").into_response(); } };
+    if runtime.anthropic {
+        let chat = anthropic::to_chat_json(&data, &requested_model);
+        record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::OK, started, chat.get("usage")).await;
+        return axum::Json(chat).into_response();
+    }
     record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::OK, started, data.get("usage")).await;
     let response_id = data.get("id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4()));
     axum::Json(json!({"id": response_id, "object": "chat.completion", "created": now(), "model": requested_model, "choices": [{"index": 0, "message": {"role": "assistant", "content": response_output_text(&data)}, "finish_reason": response_finish_reason(Some(&data))}], "usage": normalized_usage(data.get("usage"))})).into_response()
@@ -841,12 +931,33 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, "unknown", "responses", e.status, started, None).await; return e.into_response(); } };
     let requested_model = body.get("model").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or("gpt-6-astra").to_string();
     let runtime = match load_runtime(&state.config, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", e.status, started, None).await; return e.into_response(); } };
-    let outgoing = normalize_responses_request(&body, &runtime.model, &developer_prompt(&body));
+    let outgoing = if runtime.anthropic {
+        anthropic::to_anthropic_request(&body, &runtime.model, runtime.max_output)
+    } else {
+        normalize_responses_request(&body, &runtime.model, &developer_prompt(&body))
+    };
     let upstream = match request_upstream(&state, &outgoing, &runtime).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", e.status, started, None).await; return e.into_response(); } };
     if !upstream.status().is_success() { let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY); let error = upstream_error(upstream).await; record_usage(&state, &key_id, &requested_model, "responses", status, started, None).await; return error.into_response(); }
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) { let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx); tokio::spawn(stream_responses(upstream, tx, state, key_id, requested_model, started)); return response; }
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx);
+        if runtime.anthropic {
+            let model = requested_model.clone();
+            tokio::spawn(async move {
+                if let Some(completed) = anthropic::stream_as_responses(upstream, tx, model.clone()).await {
+                    record_usage(&state, &key_id, &model, "responses", StatusCode::OK, started, completed.get("usage")).await;
+                }
+            });
+        } else {
+            tokio::spawn(stream_responses(upstream, tx, state, key_id, requested_model, started));
+        }
+        return response;
+    }
     match upstream.json::<Value>().await {
-        Ok(data) => { record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, data.get("usage")).await; axum::Json(data).into_response() },
+        Ok(data) => {
+            let payload = if runtime.anthropic { anthropic::to_responses_json(&data, &requested_model) } else { data };
+            record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, payload.get("usage")).await;
+            axum::Json(payload).into_response()
+        },
         Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", StatusCode::BAD_GATEWAY, started, None).await; GatewayError::new(StatusCode::BAD_GATEWAY, format!("invalid upstream response: {e}")).with_type("api_error").with_code("invalid_upstream_response").into_response() }
     }
 }
@@ -867,10 +978,11 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
         if !origin_allowed(&state.config, origin) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "request origin is not allowed").with_type("permission_error").with_code("origin_not_allowed")); }
     }
     if request.method() == axum::http::Method::OPTIONS { let mut response = StatusCode::NO_CONTENT.into_response(); response.headers_mut().extend(cors_headers(&request, &state.config)); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS")); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Authorization, Content-Type")); response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400")); return response; }
-    if request.method() == axum::http::Method::GET && (path == "/" || path == "/v1") { return json_response(&request, &state.config, StatusCode::OK, json!({"object": "gateway", "name": "monkeycode-direct-gateway", "status": "ok", "endpoints": ["/health", "/v1/models", "/v1/responses", "/v1/chat/completions"]})); }
+    if request.method() == axum::http::Method::GET && (path == "/" || path == "/v1") { return json_response(&request, &state.config, StatusCode::OK, json!({"object": "gateway", "name": "monkeycode-direct-gateway", "status": "ok", "endpoints": ["/health", "/v1/models", "/v1/responses", "/v1/chat/completions", "/v1/admin/clients"]})); }
     if request.method() == axum::http::Method::GET && (path == "/health" || path == "/v1/health") { return json_response(&request, &state.config, StatusCode::OK, json!({"ok": true, "mode": "direct-signed-gateway", "auth_required": state.config.auth_required, "tls": state.config.tls_cert.is_some()})); }
     if request.method() == axum::http::Method::GET && path == "/admin" { return admin_page(); }
     if path == "/v1/admin/usage" && request.method() == axum::http::Method::GET { return handle_admin_usage(request, state).await; }
+    if (path == "/v1/admin/clients" || path == "/v1/admin/clients/sync") && matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::POST) { return handle_admin_clients(request, state).await; }
     if path == "/v1/admin/keys" {
         if request.method() == axum::http::Method::GET { return handle_admin_keys(request, state, None, "list").await; }
         if request.method() == axum::http::Method::POST { return handle_admin_keys(request, state, None, "create").await; }
@@ -897,7 +1009,137 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let config = Arc::new(Config::load(&args).await?);
+    match args.first().map(String::as_str).unwrap_or("") {
+        "serve" => return run_server(&args[1..]).await,
+        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "help" | "-h" | "--help" => return cli::run(&args).await,
+        "" => return cli::run(&[]).await,
+        _ => {}
+    }
+    run_server(&args).await
+}
+
+fn user_home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+}
+
+fn mk2api_home(config: &Config) -> PathBuf {
+    config.api_keys_path.parent().map(Path::to_path_buf).unwrap_or_else(|| user_home().join(".mk2api"))
+}
+
+async fn ensure_named_key(state: &AppState, name: &str, preferred: Option<String>) -> Result<clients::IssuedKey, BoxError> {
+    let preferred_raw = preferred.filter(|value| !value.is_empty());
+    let (issued, snapshot) = {
+        let mut store = state.api_keys.lock().await;
+        if let Some(raw) = preferred_raw.clone() {
+            if let Some(existing) = store.keys.iter().find(|key| !key.revoked && key.key_hash == hash_key(&raw)) {
+                return Ok(clients::IssuedKey { id: existing.id.clone(), raw });
+            }
+            let record = ApiKeyRecord {
+                id: format!("key_{}", Uuid::new_v4().simple()),
+                name: name.to_string(),
+                key_hash: hash_key(&raw),
+                created_at: now(),
+                revoked: false,
+            };
+            let issued = clients::IssuedKey { id: record.id.clone(), raw };
+            store.keys.push(record);
+            (issued, Some(store.serialized().map(|contents| (store.path.clone(), contents))?))
+        } else {
+            let raw = new_api_key();
+            let record = ApiKeyRecord {
+                id: format!("key_{}", Uuid::new_v4().simple()),
+                name: name.to_string(),
+                key_hash: hash_key(&raw),
+                created_at: now(),
+                revoked: false,
+            };
+            let issued = clients::IssuedKey { id: record.id.clone(), raw };
+            store.keys.push(record);
+            (issued, Some(store.serialized().map(|contents| (store.path.clone(), contents))?))
+        }
+    };
+    if let Some((path, contents)) = snapshot {
+        write_private(&path, &contents).await?;
+    }
+    Ok(issued)
+}
+
+async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientReport>, BoxError> {
+    let paths = clients::ClientPaths::new(user_home(), mk2api_home(&state.config));
+    if !state.config.manage_clients {
+        return Ok(vec![
+            clients::skipped("pi", paths.pi_models, "disabled"),
+            clients::skipped("codex", paths.codex_config, "disabled"),
+        ]);
+    }
+    let ids = match configured_model_ids(&state.config).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            eprintln!("client sync catalog unavailable: {}", error.message);
+            Vec::new()
+        }
+    };
+    let mut store = clients::load_store(&paths.store_path);
+    let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
+    let mut reports = Vec::new();
+    if state.config.manage_pi {
+        let preferred = store.pi.as_ref().map(|key| key.raw.clone()).or_else(|| clients::extract_pi_key(&clients::read_json_or_empty(&paths.pi_models)));
+        let key = ensure_named_key(state, "pi", preferred).await?;
+        store.pi = Some(key.clone());
+        reports.push(clients::apply_pi(&paths, &base_url, &key.raw, &ids)?);
+    } else {
+        reports.push(clients::skipped("pi", paths.pi_models.clone(), "disabled"));
+    }
+    if state.config.manage_codex {
+        let preferred = store.codex.as_ref().map(|key| key.raw.clone()).or_else(|| std::fs::read_to_string(&paths.codex_config).ok().and_then(|text| clients::extract_codex_key(&text)));
+        let key = ensure_named_key(state, "codex", preferred).await?;
+        store.codex = Some(key.clone());
+        reports.push(clients::apply_codex(&paths, &base_url, &key.raw, &ids)?);
+    } else {
+        reports.push(clients::skipped("codex", paths.codex_config.clone(), "disabled"));
+    }
+    clients::write_pretty_json(&paths.store_path, &clients::store_value(&store))?;
+    Ok(reports)
+}
+
+async fn client_sync_loop(state: AppState) {
+    let mut last = String::new();
+    loop {
+        match sync_managed_clients(&state).await {
+            Ok(reports) => {
+                let summary = reports.iter().map(|report| format!("{}:{}:{}", report.name, report.managed, report.models)).collect::<Vec<_>>().join(",");
+                if summary != last {
+                    for report in &reports {
+                        if report.managed {
+                            println!("managed {} ({} models) -> {}", report.name, report.models, report.path.as_deref().unwrap_or("-"));
+                        } else {
+                            println!("{}: {}", report.name, report.message);
+                        }
+                    }
+                    last = summary;
+                }
+            }
+            Err(error) => eprintln!("client sync failed: {error}"),
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+async fn handle_admin_clients(request: Request<Body>, state: AppState) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    let reports = match sync_managed_clients(&state).await {
+        Ok(reports) => reports,
+        Err(error) => return error_response(&request, &state.config, GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error}")).with_type("api_error")),
+    };
+    let ids = configured_model_ids(&state.config).await.unwrap_or_else(|_| Vec::new());
+    let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
+    json_response(&request, &state.config, StatusCode::OK, clients::report_json(&reports, state.config.manage_clients, &base_url, ids.len()))
+}
+
+async fn run_server(args: &[String]) -> Result<(), BoxError> {
+    let config = Arc::new(Config::load(args).await?);
     let client = reqwest::Client::builder().timeout(config.request_timeout).build()?;
     let (admin_key, generated_admin_key) = load_admin_key(&config).await?;
     if generated_admin_key {
@@ -906,6 +1148,9 @@ async fn main() -> Result<(), BoxError> {
     let api_keys = ApiKeyStore::load(config.api_keys_path.clone()).await?;
     let usage = UsageStore::load(config.usage_path.clone(), config.max_usage_records).await?;
     let state = AppState { config: config.clone(), client, admin_key: Arc::new(admin_key), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)) };
+    if config.manage_clients {
+        tokio::spawn(client_sync_loop(state.clone()));
+    }
     let state_for_fallback = state.clone();
     let fallback = tower::service_fn(move |request: Request<Body>| {
         let state = state_for_fallback.clone();
@@ -926,4 +1171,68 @@ async fn main() -> Result<(), BoxError> {
         axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_history_uses_output_text_for_assistant() {
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "again"}
+            ]
+        });
+        let outgoing = normalize_chat_request(&body, "monkeycode-ultra/gpt-test").unwrap();
+        assert_eq!(outgoing["input"][0]["role"], "developer");
+        assert_eq!(outgoing["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(outgoing["input"][2]["role"], "assistant");
+        assert_eq!(outgoing["input"][2]["content"], json!([{"type": "output_text", "text": "hello"}]));
+    }
+
+    #[test]
+    fn responses_history_rewrites_assistant_input_text() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"role": "assistant", "content": [{"type": "input_text", "text": "hello"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "again"}]}
+            ]
+        });
+        let outgoing = normalize_responses_request(&body, "monkeycode-ultra/gpt-test", "You are a helpful assistant.");
+        assert_eq!(outgoing["input"][0]["role"], "developer");
+        assert_eq!(outgoing["input"][2]["role"], "assistant");
+        assert_eq!(outgoing["input"][2]["content"], json!([{"type": "output_text", "text": "hello"}]));
+    }
+
+    #[test]
+    fn sse_block_strips_crlf() {
+        let (event, data) = sse_block("event: response.completed\r\ndata: {\"ok\":true}\r");
+        assert_eq!(event, "response.completed");
+        assert_eq!(data, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn resolve_model_prefers_monkeycode_prefix() {
+        let models = vec![
+            json!({"model": "qwen3.8-flash", "base_url": "https://other.example/v1"}),
+            json!({"model": "monkeycode-basic/qwen3.8-flash", "base_url": "https://proxy.monkeycode-ai.com/v1"}),
+        ];
+        let found = resolve_model(&models, "qwen3.8-flash").unwrap();
+        assert_eq!(found["model"], "monkeycode-basic/qwen3.8-flash");
+    }
+
+    #[test]
+    fn resolve_model_prefers_basic_over_ultra() {
+        let models = vec![
+            json!({"model": "monkeycode-ultra/deepseek-v4-flash"}),
+            json!({"model": "monkeycode-basic/deepseek-v4-flash"}),
+        ];
+        let found = resolve_model(&models, "deepseek-v4-flash").unwrap();
+        assert_eq!(found["model"], "monkeycode-basic/deepseek-v4-flash");
+    }
 }

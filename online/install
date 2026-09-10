@@ -3,12 +3,12 @@ set -euo pipefail
 
 REPO="${MONKEYCODE_REPO:-co0ontty/mk-to-api}"
 VERSION="${MONKEYCODE_VERSION:-latest}"
-INSTALL_ROOT="${MONKEYCODE_INSTALL_ROOT:-$HOME/.local/lib/monkeycode-gateway}"
+INSTALL_ROOT="${MONKEYCODE_INSTALL_ROOT:-$HOME/.local/lib/mk2api}"
 BIN_DIR="${MONKEYCODE_BIN_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)" in
   Darwin) ;;
-  *) echo "MonkeyCode Direct Gateway currently supports macOS only." >&2; exit 1 ;;
+  *) echo "mk2api currently supports macOS only." >&2; exit 1 ;;
 esac
 
 case "$(uname -m)" in
@@ -17,72 +17,57 @@ case "$(uname -m)" in
   *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-ASSET="monkeycode-direct-gateway-macos-${ARCH}.tar.gz"
+ASSET="mk2api-macos-${ARCH}.tar.gz"
+LEGACY_ASSET="monkeycode-direct-gateway-macos-${ARCH}.tar.gz"
 if [ "$VERSION" = "latest" ]; then
   URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+  LEGACY_URL="https://github.com/${REPO}/releases/latest/download/${LEGACY_ASSET}"
 else
   case "$VERSION" in v*) TAG="$VERSION" ;; *) TAG="v$VERSION" ;; esac
   URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+  LEGACY_URL="https://github.com/${REPO}/releases/download/${TAG}/${LEGACY_ASSET}"
 fi
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/monkeycode-install.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mk2api-install.XXXXXX")"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
 printf 'Downloading %s...\n' "$URL"
-curl --fail --location --silent --show-error "$URL?download=1" -o "$TMP_DIR/$ASSET"
+if ! curl --fail --location --silent --show-error "$URL?download=1" -o "$TMP_DIR/$ASSET"; then
+  printf 'Falling back to %s...\n' "$LEGACY_URL"
+  curl --fail --location --silent --show-error "$LEGACY_URL?download=1" -o "$TMP_DIR/$ASSET"
+fi
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
-if [ ! -x "$TMP_DIR/monkeycode-direct-gateway" ]; then
-  echo "Release archive does not contain monkeycode-direct-gateway" >&2
+BIN=""
+for candidate in mk2api monkeycode-direct-gateway; do
+  if [ -x "$TMP_DIR/$candidate" ]; then
+    BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$BIN" ]; then
+  echo "Release archive does not contain mk2api" >&2
   exit 1
 fi
 if [ ! -f "$TMP_DIR/VERSION" ]; then
   printf '%s\n' "$VERSION" > "$TMP_DIR/VERSION"
 fi
 
-install -m 755 "$TMP_DIR/monkeycode-direct-gateway" "$INSTALL_ROOT/monkeycode-direct-gateway"
-install -m 755 "$TMP_DIR/start-direct-gateway.sh" "$INSTALL_ROOT/start-direct-gateway.sh"
+install -m 755 "$TMP_DIR/$BIN" "$INSTALL_ROOT/mk2api"
 install -m 644 "$TMP_DIR/VERSION" "$INSTALL_ROOT/VERSION"
+ln -sfn "$INSTALL_ROOT/mk2api" "$BIN_DIR/mk2api"
+if [ -x "$INSTALL_ROOT/mk2api" ]; then
+  ln -sfn "$INSTALL_ROOT/mk2api" "$BIN_DIR/monkeycode-gateway" || true
+fi
 
-INSTALLER_URL="https://raw.githubusercontent.com/${REPO}/main/online/install?download=1"
-cat > "$BIN_DIR/monkeycode-gateway" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-INSTALL_ROOT="$INSTALL_ROOT"
-BIN_DIR="$BIN_DIR"
-VERSION_FILE="\$INSTALL_ROOT/VERSION"
-INSTALLER_URL="$INSTALLER_URL"
-
-case "\${1:-start}" in
-  update)
-    echo "Updating MonkeyCode Direct Gateway from GitHub Release..."
-    exec env MONKEYCODE_VERSION=latest MONKEYCODE_GATEWAY_START=1 MONKEYCODE_INSTALL_ROOT="\$INSTALL_ROOT" MONKEYCODE_BIN_DIR="\$BIN_DIR" bash -c "\$(curl --fail --location --silent --show-error "\$INSTALLER_URL")"
-    ;;
-  version)
-    if [ -f "\$VERSION_FILE" ]; then cat "\$VERSION_FILE"; else echo "unknown"; fi
-    ;;
-  check-update)
-    current="\$(if [ -f "\$VERSION_FILE" ]; then cat "\$VERSION_FILE"; else echo unknown; fi)"
-    latest="\$(curl --fail --location --silent --show-error "https://api.github.com/repos/${REPO}/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
-    echo "installed: \$current"
-    echo "latest:    \$latest"
-    if [ "\$current" = "\$latest" ]; then echo "already up to date"; else echo "update available: run monkeycode-gateway update"; fi
-    ;;
-  *)
-    exec env DIRECT_GATEWAY_BIN="\$INSTALL_ROOT/monkeycode-direct-gateway" "\$INSTALL_ROOT/start-direct-gateway.sh" "\$@"
-    ;;
-esac
-EOF
-chmod 755 "$BIN_DIR/monkeycode-gateway"
-
-printf '\nInstalled MonkeyCode Direct Gateway to %s\n' "$INSTALL_ROOT"
-printf 'Command: %s/monkeycode-gateway\n' "$BIN_DIR"
-printf 'Admin UI: http://0.0.0.0:8123/admin\n'
+printf '\nInstalled mk2api to %s\n' "$INSTALL_ROOT"
+printf 'Command: %s/mk2api\n' "$BIN_DIR"
+printf 'Config: %s/.mk2api\n' "$HOME"
 
 if [ "${MONKEYCODE_GATEWAY_START:-1}" = "1" ]; then
-  "$BIN_DIR/monkeycode-gateway" start
+  MK2API_NONINTERACTIVE=1 "$BIN_DIR/mk2api" start
 else
-  printf 'Automatic start disabled. Run: %s/monkeycode-gateway start\n' "$BIN_DIR"
+  printf 'Automatic start disabled. Run: %s/mk2api start\n' "$BIN_DIR"
 fi

@@ -36,17 +36,16 @@ jobs:
       - name: Package asset
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/monkeycode-direct-gateway dist/monkeycode-direct-gateway
-          cp start-direct-gateway.sh dist/start-direct-gateway.sh
-          chmod 755 dist/monkeycode-direct-gateway dist/start-direct-gateway.sh
+          cp target/${{ matrix.target }}/release/mk2api dist/mk2api
+          chmod 755 dist/mk2api
           printf '%s\n' '${{ github.event.release.tag_name }}' > dist/VERSION
-          tar -czf monkeycode-direct-gateway-macos-${{ matrix.arch }}.tar.gz -C dist monkeycode-direct-gateway start-direct-gateway.sh VERSION
+          tar -czf mk2api-macos-${{ matrix.arch }}.tar.gz -C dist mk2api VERSION
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: monkeycode-direct-gateway-macos-${{ matrix.arch }}.tar.gz
+          path: mk2api-macos-${{ matrix.arch }}.tar.gz
 
   publish-assets:
     name: Publish release assets
