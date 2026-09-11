@@ -14,7 +14,16 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x "$SOURCE" ] || [ src/main.rs -nt "$SOURCE" ] || [ src/cli.rs -nt "$SOURCE" ] || [ src/clients.rs -nt "$SOURCE" ] || [ src/anthropic.rs -nt "$SOURCE" ] || [ Cargo.toml -nt "$SOURCE" ]; then
+# 只要 src/ 下任意文件或 Cargo.toml 比产物新，就重新编译。
+# 之前只对比少数几个文件，新增 update.rs / dashboard 改动会被漏掉，导致装上旧二进制。
+needs_build() {
+  [ ! -x "$SOURCE" ] && return 0
+  [ "$SCRIPT_DIR/Cargo.toml" -nt "$SOURCE" ] && return 0
+  [ -n "$(find "$SCRIPT_DIR/src" -type f -newer "$SOURCE" -print -quit 2>/dev/null)" ] && return 0
+  return 1
+}
+
+if needs_build; then
   echo "building mk2api"
   cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 fi
