@@ -1,6 +1,18 @@
-# v0.1.24 — 管理密钥可在后台修改
+# v0.1.25 — 多端鉴权与 Anthropic 流式兼容
 
-「系统信息 → 管理密钥」支持修改 Admin Key：可自己填写，也可留空随机生成。保存后旧密钥立即失效，当前浏览器自动切换到新密钥。
+## 鉴权
+
+除了 `Authorization: Bearer <API Key>`，现在也接受 Anthropic 生态的 `x-api-key` 和 Google 生态的 `x-goog-api-key`。
+
+Claude Code、cc-switch 的 anthropic-messages、Cherry Studio 等客户端不再因为密钥头格式不同而拿到 401（也就是「获取模型列表失败」）。
+
+## Anthropic 流式
+
+完善 Anthropic Messages → OpenAI Responses 的流式转换：
+
+- thinking-only 的回合不再被判定为空完成
+- 上游缺少 `content_block_stop` 时，收尾会正确 flush 未闭合的块
+- `message_start` 的 input tokens 在整段流里保持不被覆盖
 
 ## 安装
 

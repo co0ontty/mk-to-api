@@ -844,7 +844,7 @@ function renderSystem(){
 
   $('#connectKv').innerHTML = [
     ['Base URL', `<span class="mono">${esc(info.base_url || '-')}</span>`],
-    ['鉴权方式', '<span class="mono">Authorization: Bearer &lt;API Key&gt;</span>'],
+    ['鉴权方式', '<span class="mono">Authorization: Bearer &lt;API Key&gt;</span> 或 <span class="mono">x-api-key</span> / <span class="mono">x-goog-api-key</span>'],
     ['Responses', '<span class="mono">POST /v1/responses</span>'],
     ['Chat Completions', '<span class="mono">POST /v1/chat/completions</span>'],
     ['模型列表', '<span class="mono">GET /v1/models</span>'],
