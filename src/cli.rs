@@ -51,6 +51,7 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
             Ok(())
         }
         "clients" => clients_command(&args.get(1..).unwrap_or(&[])).await,
+        "dashboard" | "web" => dashboard_command(&args.get(1..).unwrap_or(&[])).await,
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -129,7 +130,10 @@ Usage:
   mk2api stop         Stop the background service
   mk2api restart      Restart the background service
   mk2api status       Show service status
-  mk2api tui          Open the usage dashboard
+  mk2api tui          Open the usage dashboard in the terminal
+  mk2api dashboard    Open the web console (alias: web)
+  mk2api dashboard --no-open
+                      Print the summary without launching a browser
   mk2api setup        Create ~/.mk2api/config.json
   mk2api install      Install this binary as mk2api
   mk2api clients      Detect Pi/Codex configs and keep them pointed at mk2api
@@ -421,6 +425,7 @@ async fn start() -> Result<(), BoxError> {
                 config.port
             );
             println!("admin: http://{}:{}/admin", display_host(&config.host), config.port);
+            println!("web console: mk2api dashboard");
             println!("config: {}", config_path()?.display());
             println!("log: {}", log_path().display());
             return Ok(());
@@ -457,6 +462,11 @@ async fn status() -> Result<(), BoxError> {
             display_host(&config.host),
             config.port
         );
+        println!(
+            "web console: http://{}:{}/admin",
+            display_host(&config.host),
+            config.port
+        );
         return Ok(());
     }
     if service_loaded() {
@@ -466,6 +476,103 @@ async fn status() -> Result<(), BoxError> {
     }
     println!("mk2api is not running");
     Err(boxed("not running"))
+}
+
+/// `mk2api dashboard`：打开 Web 控制台，并在终端里顺手打一份摘要。
+///
+/// 中文说明：服务没起来时不去自动启动——启动涉及 launchd 与端口选择，
+/// 属于 `mk2api start` 的职责，这里只给出明确提示，避免命令间职责重叠。
+async fn dashboard_command(args: &[String]) -> Result<(), BoxError> {
+    let config = load_or_default()?;
+    if !health(&config).await {
+        return Err(boxed("mk2api is not running. Try: mk2api start"));
+    }
+    let host = display_host(&config.host);
+    let base = format!("http://{host}:{}", config.port);
+    let url = format!("{base}/admin");
+    let no_open = args.iter().any(|value| value == "--no-open");
+    if !no_open {
+        open_browser(&url);
+    }
+    println!("mk2api web console  •  {url}");
+    if no_open || io::stdout().is_terminal() {
+        print_dashboard_summary(&base, &admin_key()?).await?;
+    }
+    Ok(())
+}
+
+/// 在默认浏览器中打开控制台。非 macOS 平台打印链接即可。
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("xdg-open").arg(url).status();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = url;
+    }
+}
+
+/// 拉取看板统计并输出一屏摘要（终端用户不必先打开浏览器就能看到关键指标）。
+async fn print_dashboard_summary(base: &str, admin: &str) -> Result<(), BoxError> {
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build()?;
+    let fetch = |window: u64| {
+        let client = client.clone();
+        let url = format!("{base}/v1/admin/stats?window={window}");
+        let admin = admin.to_string();
+        async move {
+            let response = client.get(&url).header("Authorization", format!("Bearer {admin}")).send().await?;
+            if !response.status().is_success() {
+                return Err(boxed(format!("dashboard request failed ({})", response.status())));
+            }
+            response.json::<Value>().await.map_err(BoxError::from)
+        }
+    };
+    let day = fetch(86_400).await?;
+    let all = fetch(0).await?;
+
+    let number = |value: &Value, key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let tokens = |value: &Value| number(value, "total_tokens");
+    println!();
+    println!("                 {:>12} {:>12}", "24 小时", "全部时间");
+    for (label, key) in [("请求数", "requests"), ("错误数", "errors"), ("输入 token", "input_tokens"), ("输出 token", "output_tokens"), ("合计 token", "total_tokens")] {
+        println!("{label:<10} {:>12} {:>12}", number(&day, key), number(&all, key));
+    }
+    println!(
+        "{:<10} {:>11.1}% {:>11.1}%",
+        "成功率",
+        day.get("success_rate").and_then(Value::as_f64).unwrap_or(0.0),
+        all.get("success_rate").and_then(Value::as_f64).unwrap_or(0.0)
+    );
+    println!(
+        "{:<10} {:>10}ms {:>10}ms",
+        "平均延迟",
+        number(&day, "avg_latency_ms"),
+        number(&all, "avg_latency_ms")
+    );
+
+    for (title, key) in [("模型 TOP5", "by_model"), ("API Key TOP5", "by_key")] {
+        println!("\n{title}");
+        let items = day.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+        if items.is_empty() {
+            println!("  (24 小时内没有调用)");
+            continue;
+        }
+        for item in items.iter().take(5) {
+            println!(
+                "  {:<44} {:>6} requests {:>12} tokens",
+                item.get("name").and_then(Value::as_str).unwrap_or("unknown"),
+                number(item, "requests"),
+                tokens(item)
+            );
+        }
+    }
+    println!("\n完整看板: {base}/admin   （终端视图: mk2api tui）");
+    Ok(())
 }
 
 async fn clients_command(args: &[String]) -> Result<(), BoxError> {

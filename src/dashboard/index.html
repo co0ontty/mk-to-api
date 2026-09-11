@@ -1,0 +1,1059 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.svg">
+<title>mk2api 控制台</title>
+<style>
+/* ---------------------------------------------------------------
+   设计基调：深色、低饱和、数据优先。
+   颜色全部走 CSS 变量，方便统一调整；不使用外部依赖。
+----------------------------------------------------------------*/
+:root{
+  --bg:#0b0e14; --panel:#121722; --panel-2:#161d2b; --line:#222b3d;
+  --text:#e6ebf5; --muted:#8b98b0; --dim:#5d6b85;
+  --accent:#4c8dff; --accent-soft:#4c8dff22;
+  --ok:#3ddc97; --warn:#ffb648; --bad:#ff6b6b; --violet:#a78bfa;
+  --radius:14px; --radius-sm:9px;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(900px 500px at 15% -10%, #4c8dff1a, transparent 60%),
+    radial-gradient(700px 400px at 100% 0%, #a78bfa14, transparent 60%);
+}
+a{color:var(--accent);text-decoration:none}
+button,input,select,textarea{font:inherit;color:inherit}
+.hidden{display:none !important}
+code,.mono{font-family:var(--mono)}
+
+/* ---------- 登录闸门 ---------- */
+.gate{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(6,9,15,.86);backdrop-filter:blur(6px)}
+.gate-card{width:min(430px,92vw);background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:30px 28px;box-shadow:0 30px 80px #0009}
+.brand{display:flex;align-items:center;gap:11px;font-weight:650;letter-spacing:.3px}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+.brand small{display:block;font-weight:400;color:var(--dim);font-size:11.5px;letter-spacing:.4px}
+.gate-card h1{font-size:19px;margin:20px 0 6px}
+.gate-card p{color:var(--muted);font-size:13px;margin:0 0 18px}
+.gate-note{font-size:12px;color:var(--dim);margin-top:14px;line-height:1.7}
+
+/* ---------- 布局 ---------- */
+.shell{position:relative;z-index:1;display:grid;grid-template-columns:216px 1fr;min-height:100vh}
+.side{border-right:1px solid var(--line);padding:20px 14px;display:flex;flex-direction:column;gap:6px;position:sticky;top:0;height:100vh}
+.side .brand{padding:4px 8px 18px}
+.nav{display:flex;flex-direction:column;gap:3px}
+.nav button{
+  all:unset;cursor:pointer;display:flex;align-items:center;gap:10px;
+  padding:9px 11px;border-radius:var(--radius-sm);color:var(--muted);font-size:13.5px;font-weight:500;
+}
+.nav button:hover{background:#ffffff08;color:var(--text)}
+.nav button.active{background:var(--accent-soft);color:var(--text);box-shadow:inset 0 0 0 1px #4c8dff33}
+.nav button i{width:16px;text-align:center;font-style:normal;opacity:.85}
+.side-foot{margin-top:auto;font-size:11.5px;color:var(--dim);padding:0 10px;line-height:1.8}
+.main{padding:22px 26px 60px;min-width:0}
+
+/* ---------- 顶栏 ---------- */
+.topbar{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.topbar h1{font-size:21px;margin:0 0 4px;letter-spacing:.2px}
+.topbar .sub{color:var(--muted);font-size:12.5px}
+.toolbar{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.seg{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px;gap:2px}
+.seg button{all:unset;cursor:pointer;padding:6px 12px;border-radius:7px;font-size:12.5px;color:var(--muted)}
+.seg button:hover{color:var(--text)}
+.seg button.active{background:#ffffff12;color:var(--text)}
+.btn{all:unset;cursor:pointer;background:var(--panel);border:1px solid var(--line);padding:8px 14px;border-radius:10px;font-size:12.5px;color:var(--text);transition:.15s}
+.btn:hover{border-color:#31405c;background:var(--panel-2)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.danger{color:var(--bad);border-color:#ff6b6b33}
+.btn.danger:hover{background:#ff6b6b14}
+.btn.sm{padding:5px 10px;font-size:12px;border-radius:8px}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+
+/* ---------- 卡片 ---------- */
+.grid{display:grid;gap:14px}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(178px,1fr));margin-bottom:14px}
+.card{background:linear-gradient(180deg,var(--panel),#101622);border:1px solid var(--line);border-radius:var(--radius);padding:16px 17px}
+.card h3{margin:0 0 2px;font-size:13px;font-weight:600;letter-spacing:.2px}
+.card .hint{color:var(--dim);font-size:11.5px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px}
+.kpi .label{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:7px}
+.kpi .value{font-size:25px;font-weight:600;letter-spacing:-.4px;margin:9px 0 3px;font-variant-numeric:tabular-nums}
+.kpi .foot{font-size:11.5px;color:var(--dim)}
+.trend{font-size:11.5px;font-weight:600}
+.trend.up{color:var(--ok)} .trend.down{color:var(--bad)} .trend.flat{color:var(--dim)}
+.testid{position:relative}
+.spark{display:block;width:100%;height:30px;margin-top:10px;overflow:visible}
+
+/* ---------- 图表 ---------- */
+.chart-wrap{position:relative}
+.chart{display:block;width:100%;height:230px;overflow:visible}
+.chart .gridline{stroke:#ffffff0f;stroke-width:1}
+.chart .axis{fill:var(--dim);font-size:10.5px}
+.legend{display:flex;gap:16px;font-size:11.5px;color:var(--muted);flex-wrap:wrap;margin-top:6px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px;vertical-align:middle}
+.bars{display:flex;flex-direction:column;gap:11px}
+.bar-row{display:grid;grid-template-columns:1fr auto;gap:4px 10px;font-size:12.5px}
+.bar-row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.bar-row .num{color:var(--muted);font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:11.5px}
+.bar-track{grid-column:1/-1;height:6px;background:#ffffff0d;border-radius:99px;overflow:hidden}
+.bar-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--violet))}
+.donut{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.donut svg{width:132px;height:132px;flex:none}
+.donut .legend{flex-direction:column;gap:8px}
+
+/* ---------- 表格 ---------- */
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel)}
+table{width:100%;border-collapse:collapse;font-size:12.8px}
+th,td{text-align:left;padding:10px 13px;border-bottom:1px solid #ffffff0d;white-space:nowrap}
+th{color:var(--muted);font-weight:600;font-size:11.5px;letter-spacing:.3px;background:#ffffff05;position:sticky;top:0;z-index:1;cursor:default;user-select:none}
+th.sortable{cursor:pointer}
+th.sortable:hover{color:var(--text)}
+th .arrow{opacity:.35;margin-left:4px;font-size:10px}
+th.sorted .arrow{opacity:1;color:var(--accent)}
+tbody tr:hover{background:#ffffff06}
+tbody tr:last-child td{border-bottom:none}
+td.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;letter-spacing:.2px}
+.pill.ok{background:#3ddc9718;color:var(--ok)}
+.pill.warn{background:#ffb64818;color:var(--warn)}
+.pill.bad{background:#ff6b6b18;color:var(--bad)}
+.pill.mute{background:#ffffff0f;color:var(--muted)}
+.pill.info{background:#4c8dff18;color:var(--accent)}
+.truncate{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:bottom}
+.empty{padding:38px 16px;text-align:center;color:var(--dim);font-size:13px}
+.row-actions{display:flex;gap:6px}
+
+/* ---------- 表单 ---------- */
+input,select{background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:8px 11px;font-size:13px;outline:none;transition:.15s}
+input:focus,select:focus{border-color:#3f6fd0;box-shadow:0 0 0 3px #4c8dff22}
+input::placeholder{color:var(--dim)}
+label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--muted)}
+.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:13px}
+.filters label.field{min-width:150px}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px;font-size:12.5px;color:var(--muted);flex-wrap:wrap}
+
+/* ---------- 提示 ---------- */
+.toasts{position:fixed;right:18px;bottom:18px;z-index:80;display:flex;flex-direction:column;gap:9px;max-width:min(380px,86vw)}
+.toast{background:var(--panel-2);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;padding:11px 14px;font-size:12.8px;box-shadow:0 14px 40px #0007;animation:slide .22s ease}
+.toast.ok{border-left-color:var(--ok)} .toast.bad{border-left-color:var(--bad)} .toast.warn{border-left-color:var(--warn)}
+@keyframes slide{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
+.banner{border:1px solid #ffb64833;background:#ffb64810;color:#ffd79a;border-radius:var(--radius-sm);padding:10px 13px;font-size:12.5px;margin-bottom:14px}
+.secret{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#1b2333;border:1px dashed #3f6fd0;border-radius:var(--radius-sm);padding:12px 14px;margin-bottom:14px}
+.secret .value{font-family:var(--mono);font-size:12.5px;word-break:break-all;flex:1;min-width:220px}
+.kv{display:grid;grid-template-columns:132px 1fr;gap:7px 14px;font-size:12.8px}
+.kv div:nth-child(odd){color:var(--muted)}
+.mono-block{font-family:var(--mono);font-size:12.2px;background:#0d1220;border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px 14px;overflow:auto;color:#c9d6ef}
+
+@media (max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .side{position:static;height:auto;flex-direction:row;align-items:center;overflow-x:auto;border-right:none;border-bottom:1px solid var(--line);padding:12px}
+  .side .brand{padding:0 14px 0 4px}
+  .nav{flex-direction:row}
+  .side-foot{display:none}
+  .main{padding:18px 15px 60px}
+  .kv{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<!-- 登录闸门：Admin Key 只写入本机 localStorage，不发往任何第三方 -->
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <div class="brand"><span class="dot"></span><span>mk2api 控制台<small>MONKEYCODE SIGNED GATEWAY</small></span></div>
+    <h1>使用 Admin Key 登录</h1>
+    <p>密钥保存在 <code>~/.mk2api/admin.key</code>，仅存放在当前浏览器的 localStorage。</p>
+    <label class="field">Admin Key
+      <input id="gateKey" type="password" placeholder="mk_admin_..." autocomplete="off">
+    </label>
+    <div style="display:flex;gap:9px;margin-top:16px">
+      <button class="btn primary" id="gateLogin">进入控制台</button>
+      <button class="btn" id="gateClear">清除本地密钥</button>
+    </div>
+    <div class="gate-note" id="gateMsg">若密钥正确但仍被拒绝，请检查服务是否已重启加载最新版本。</div>
+  </div>
+</div>
+
+<div class="shell hidden" id="shell">
+  <aside class="side">
+    <div class="brand"><span class="dot"></span><span>mk2api<small id="sideVersion">SIGNED GATEWAY</small></span></div>
+    <nav class="nav" id="nav">
+      <button data-view="overview" class="active"><i>◧</i>概览</button>
+      <button data-view="usage"><i>◫</i>用量分析</button>
+      <button data-view="keys"><i>❖</i>API Key</button>
+      <button data-view="models"><i>◇</i>模型</button>
+      <button data-view="logs"><i>≡</i>调用日志</button>
+      <button data-view="system"><i>⚙</i>系统信息</button>
+    </nav>
+    <div class="side-foot">
+      <div id="sideBase">-</div>
+      <div><a href="#" id="logout">退出登录</a></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1 id="viewTitle">概览</h1>
+        <div class="sub" id="viewSub">实时用量与健康状态</div>
+      </div>
+      <div class="toolbar">
+        <div class="seg" id="range">
+          <button data-range="3600">1 小时</button>
+          <button data-range="86400" class="active">24 小时</button>
+          <button data-range="604800">7 天</button>
+          <button data-range="2592000">30 天</button>
+          <button data-range="0">全部</button>
+        </div>
+        <select id="refresh" title="自动刷新间隔">
+          <option value="0">手动刷新</option>
+          <option value="5000">5 秒自动</option>
+          <option value="10000" selected>10 秒自动</option>
+          <option value="30000">30 秒自动</option>
+        </select>
+        <button class="btn primary" id="refreshNow">刷新</button>
+      </div>
+    </div>
+
+    <div id="banners"></div>
+
+    <!-- ============ 概览 ============ -->
+    <section data-view="overview">
+      <div class="grid kpis" id="kpis"></div>
+      <div class="grid" style="grid-template-columns:minmax(0,2fr) minmax(0,1fr)">
+        <div class="card">
+          <div class="card-head">
+            <div><h3>用量趋势</h3><div class="hint" id="trendHint">按请求数与 token 汇总</div></div>
+            <div class="legend"><span><i style="background:var(--accent)"></i>请求数</span><span><i style="background:var(--violet)"></i>Token</span><span><i style="background:var(--bad)"></i>错误</span></div>
+          </div>
+          <div class="chart-wrap"><svg class="chart" id="trendChart" preserveAspectRatio="none"></svg></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div><h3>状态码分布</h3><div class="hint">响应状态占比</div></div></div>
+          <div class="donut" id="statusDonut"></div>
+        </div>
+      </div>
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr));margin-top:14px">
+        <div class="card"><div class="card-head"><div><h3>模型排行</h3><div class="hint">按请求量</div></div></div><div class="bars" id="topModels"></div></div>
+        <div class="card"><div class="card-head"><div><h3>API Key 排行</h3><div class="hint">按请求量</div></div></div><div class="bars" id="topKeys"></div></div>
+        <div class="card"><div class="card-head"><div><h3>端点排行</h3><div class="hint">OpenAI 兼容端点</div></div></div><div class="bars" id="topEndpoints"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="card-head"><div><h3>最近调用</h3><div class="hint">最新 12 条记录</div></div><button class="btn sm" data-goto="logs">查看全部</button></div>
+        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr><th>时间</th><th>模型</th><th>端点</th><th>API Key</th><th>状态</th><th style="text-align:right">延迟</th><th style="text-align:right">Token</th></tr></thead><tbody id="recentBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ============ 用量分析 ============ -->
+    <section data-view="usage" class="hidden">
+      <div class="grid kpis" id="usageKpis"></div>
+      <div class="card">
+        <div class="card-head">
+          <div><h3>用量明细</h3><div class="hint">按维度聚合当前时间窗数据</div></div>
+          <div class="seg" id="dimension">
+            <button data-dim="by_model" class="active">模型</button>
+            <button data-dim="by_key">API Key</button>
+            <button data-dim="by_endpoint">端点</button>
+            <button data-dim="by_status">状态码</button>
+          </div>
+        </div>
+        <div class="table-wrap" style="border:none;background:transparent">
+          <table><thead><tr>
+            <th class="sortable" data-sort="name">名称<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="requests" style="text-align:right">请求数<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="input_tokens" style="text-align:right">输入 Token<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="output_tokens" style="text-align:right">输出 Token<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="total_tokens" style="text-align:right">合计 Token<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="success_rate" style="text-align:right">成功率<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="avg_latency_ms" style="text-align:right">平均延迟<span class="arrow">↕</span></th>
+            <th class="sortable" data-sort="last_seen" style="text-align:right">最后调用<span class="arrow">↕</span></th>
+          </tr></thead><tbody id="usageBody"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ API Key ============ -->
+    <section data-view="keys" class="hidden">
+      <div class="card">
+        <div class="card-head"><div><h3>签发 API Key</h3><div class="hint">明文仅在创建/轮换时展示一次，服务端只保存 SHA-256 摘要</div></div></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <label class="field" style="min-width:220px">名称（用于区分客户端）
+            <input id="newKeyName" placeholder="例如 production-app" autocomplete="off">
+          </label>
+          <label class="field" style="min-width:220px">备注（可选）
+            <input id="newKeyNote" placeholder="例如 给同事 A 的临时 Key" autocomplete="off">
+          </label>
+          <button class="btn primary" id="createKey">创建 Key</button>
+        </div>
+      </div>
+      <div id="secretBox"></div>
+      <div class="card" style="margin-top:14px">
+        <div class="card-head"><div><h3>Key 列表</h3><div class="hint" id="keyCount">-</div></div><button class="btn sm" id="reloadKeys">重新加载</button></div>
+        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr>
+          <th>名称</th><th>备注</th><th>Key ID</th><th>创建时间</th><th>状态</th>
+          <th class="sortable" data-sort="requests" style="text-align:right">请求数<span class="arrow">↕</span></th>
+          <th class="sortable" data-sort="tokens" style="text-align:right">Token<span class="arrow">↕</span></th>
+          <th style="text-align:right">操作</th>
+        </tr></thead><tbody id="keysBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ============ 模型 ============ -->
+    <section data-view="models" class="hidden">
+      <div class="card">
+        <div class="card-head"><div><h3>模型目录</h3><div class="hint" id="modelHint">来自 OhMyAgent 上游配置，短名称会自动补齐 monkeycode-basic/ 前缀</div></div></div>
+        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr><th>模型 ID</th><th>类型</th><th class="sortable" data-sort="requests" style="text-align:right">请求数<span class="arrow">↕</span></th><th class="sortable" data-sort="total_tokens" style="text-align:right">Token<span class="arrow">↕</span></th><th class="sortable" data-sort="success_rate" style="text-align:right">成功率<span class="arrow">↕</span></th><th class="sortable" data-sort="avg_latency_ms" style="text-align:right">平均延迟<span class="arrow">↕</span></th></tr></thead><tbody id="modelsBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ============ 调用日志 ============ -->
+    <section data-view="logs" class="hidden">
+      <div class="card">
+        <div class="card-head"><div><h3>调用日志</h3><div class="hint" id="logHint">服务端过滤 + 分页</div></div><button class="btn sm" id="logReset">重置筛选</button></div>
+        <div class="filters">
+          <label class="field">模型 / 端点关键词<input id="fKeyword" placeholder="模糊匹配" autocomplete="off"></label>
+          <label class="field">API Key<select id="fKey"><option value="">全部</option></select></label>
+          <label class="field">端点<select id="fEndpoint"><option value="">全部</option></select></label>
+          <label class="field">状态<input id="fStatus" placeholder="如 200 或 4xx" autocomplete="off"></label>
+          <label class="field">每页<select id="fLimit"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
+          <button class="btn" id="logApply">查询</button>
+        </div>
+        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr><th>时间</th><th>模型</th><th>端点</th><th>API Key</th><th>状态</th><th style="text-align:right">延迟</th><th style="text-align:right">输入</th><th style="text-align:right">输出</th></tr></thead><tbody id="logBody"></tbody></table></div>
+        <div class="pager">
+          <span id="logPageInfo">-</span>
+          <span style="display:flex;gap:8px"><button class="btn sm" id="logPrev">上一页</button><button class="btn sm" id="logNext">下一页</button></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 系统信息 ============ -->
+    <section data-view="system" class="hidden">
+      <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">
+        <div class="card"><div class="card-head"><div><h3>服务状态</h3><div class="hint">本地网关运行时信息</div></div></div><div class="kv" id="systemKv"></div></div>
+        <div class="card"><div class="card-head"><div><h3>客户端托管</h3><div class="hint">Pi / Codex 配置同步结果</div></div><button class="btn sm" id="syncClients">立即同步</button></div><div id="clientsBox" class="kv"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="card-head"><div><h3>接入方式</h3><div class="hint">把 Base URL 与 API Key 填进任意 OpenAI 兼容客户端</div></div></div>
+        <div class="kv" id="connectKv"></div>
+        <div class="mono-block" id="curlSample" style="margin-top:14px"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+/* =================================================================
+   前端逻辑：无构建步骤、无外部依赖，直接由 Rust 静态内嵌分发。
+   ================================================================= */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const KEY_STORAGE = 'mk2api_admin_key';
+const state = {
+  adminKey: localStorage.getItem(KEY_STORAGE) || '',
+  view: 'overview',
+  range: 86400,
+  dimension: 'by_model',
+  stats: null,
+  keys: [],
+  models: [],
+  clients: null,
+  usageSort: { key: 'requests', dir: -1 },
+  keySort: { key: 'requests', dir: -1 },
+  modelSort: { key: 'requests', dir: -1 },
+  logs: { offset: 0, limit: 50, total: 0, items: [], filters: {} },
+  timer: null,
+};
+
+/* ---------------- 通用工具 ---------------- */
+function esc(value){return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function num(value){return Number(value || 0).toLocaleString('en-US');}
+function compact(value){
+  const n = Number(value || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'K';
+  return num(n);
+}
+function ms(value){
+  const n = Number(value || 0);
+  return n >= 1000 ? (n / 1000).toFixed(2) + ' s' : n + ' ms';
+}
+function timeOf(ts){
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  const p = v => String(v).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function agoOf(ts){
+  if (!ts) return '从未调用';
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (diff < 60) return diff + ' 秒前';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  return Math.floor(diff / 86400) + ' 天前';
+}
+function statusPill(status){
+  const cls = status < 300 ? 'ok' : status < 500 ? 'warn' : 'bad';
+  return `<span class="pill ${cls}">${status}</span>`;
+}
+function ratePill(rate){
+  const cls = rate >= 99 ? 'ok' : rate >= 90 ? 'warn' : 'bad';
+  return `<span class="pill ${cls}">${(Number(rate) || 0).toFixed(1)}%</span>`;
+}
+function toast(message, kind = 'ok'){
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = message;
+  $('#toasts').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .25s'; setTimeout(() => el.remove(), 260); }, 3600);
+}
+
+/* ---------------- API 客户端 ---------------- */
+async function api(path, options = {}){
+  const response = await fetch(path, {
+    ...options,
+    headers: { 'Authorization': 'Bearer ' + state.adminKey, 'Content-Type': 'application/json', ...(options.headers || {}) },
+  });
+  const text = await response.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { error: { message: text } }; }
+  if (!response.ok) {
+    const error = new Error(data?.error?.message || ('HTTP ' + response.status));
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+/* ---------------- SVG 图表 ---------------- */
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs = {}){
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+function niceMax(value){
+  if (value <= 0) return 1;
+  const exp = Math.floor(Math.log10(value));
+  const base = Math.pow(10, exp);
+  const step = [1, 2, 2.5, 5, 10].find(s => value / base <= s) || 10;
+  return step * base;
+}
+/** 折线 + 面积趋势图，双 Y 轴（左：请求数，右：token）。 */
+function renderTrend(series){
+  const svg = $('#trendChart');
+  svg.innerHTML = '';
+  if (!series || !series.length) return;
+  // 图表所在视图可能刚切换过来、宽度尚未计算完成，退回容器宽度或默认值。
+  const W = svg.clientWidth || svg.parentElement?.clientWidth || 720, H = 230, padL = 46, padR = 52, padT = 14, padB = 26;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxReq = niceMax(Math.max(...series.map(d => d.requests), 1));
+  const maxTok = niceMax(Math.max(...series.map(d => d.tokens), 1));
+  const maxErr = niceMax(Math.max(...series.map(d => d.errors), 1));
+  const x = i => padL + (series.length === 1 ? innerW / 2 : (i / (series.length - 1)) * innerW);
+  const yReq = v => padT + innerH - (v / maxReq) * innerH;
+  const yTok = v => padT + innerH - (v / maxTok) * innerH;
+
+  // 网格与左侧刻度
+  for (let i = 0; i <= 4; i++){
+    const y = padT + (i / 4) * innerH;
+    svg.appendChild(svgEl('line', { class: 'gridline', x1: padL, x2: W - padR, y1: y, y2: y }));
+    const label = svgEl('text', { class: 'axis', x: padL - 8, y: y + 3.5, 'text-anchor': 'end' });
+    label.textContent = compact(Math.round(maxReq * (1 - i / 4)));
+    svg.appendChild(label);
+    const right = svgEl('text', { class: 'axis', x: W - padR + 8, y: y + 3.5 });
+    right.textContent = compact(Math.round(maxTok * (1 - i / 4)));
+    svg.appendChild(right);
+  }
+
+  const line = key => series.map((d, i) => `${i === 0 ? 'M' : 'L'}${x(i)},${key(d)}`).join(' ');
+  const area = key => `${line(key)} L${x(series.length - 1)},${padT + innerH} L${x(0)},${padT + innerH} Z`;
+
+  const gradient = svgEl('linearGradient', { id: 'trendFill', x1: 0, y1: 0, x2: 0, y2: 1 });
+  gradient.appendChild(svgEl('stop', { offset: '0%', 'stop-color': '#4c8dff', 'stop-opacity': .35 }));
+  gradient.appendChild(svgEl('stop', { offset: '100%', 'stop-color': '#4c8dff', 'stop-opacity': 0 }));
+  const defs = svgEl('defs'); defs.appendChild(gradient); svg.appendChild(defs);
+
+  svg.appendChild(svgEl('path', { d: area(d => yReq(d.requests)), fill: 'url(#trendFill)' }));
+  svg.appendChild(svgEl('path', { d: line(d => yReq(d.requests)), fill: 'none', stroke: '#4c8dff', 'stroke-width': 2, 'stroke-linejoin': 'round' }));
+  svg.appendChild(svgEl('path', { d: line(d => yTok(d.tokens)), fill: 'none', stroke: '#a78bfa', 'stroke-width': 1.6, 'stroke-dasharray': '4 3' }));
+
+  series.forEach((d, i) => {
+    if (d.errors > 0){
+      const cy = yReq(d.requests) - 3 - (d.errors / maxErr) * 12;
+      svg.appendChild(svgEl('circle', { cx: x(i), cy, r: 3, fill: '#ff6b6b' }));
+    }
+    // 数据点附带 title，悬停即出现原生提示，无需额外 tooltip 层
+    const hit = svgEl('rect', { x: x(i) - innerW / (series.length * 2) - 1, y: padT, width: Math.max(4, innerW / series.length), height: innerH, fill: 'transparent' });
+    const tip = svgEl('title');
+    tip.textContent = `${timeOf(d.timestamp)}\n请求 ${num(d.requests)} · Token ${num(d.tokens)} · 错误 ${num(d.errors)}`;
+    hit.appendChild(tip);
+    svg.appendChild(hit);
+  });
+
+  // X 轴标签：按实际分桶间隔自适应。按小时分桶显示 HH:00，按天分桶显示 MM-DD。
+  const gap = series.length > 1 ? series[1].timestamp - series[0].timestamp : 3600;
+  const byDay = gap >= 86_400;
+  const ticks = [0, Math.round((series.length - 1) / 3), Math.round(((series.length - 1) * 2) / 3), series.length - 1]
+    .filter((value, index, arr) => arr.indexOf(value) === index);
+  ticks.forEach(index => {
+    const label = svgEl('text', {
+      class: 'axis', x: x(index), y: H - 8,
+      'text-anchor': index === 0 ? 'start' : index === series.length - 1 ? 'end' : 'middle',
+    });
+    const stamp = timeOf(series[index].timestamp);
+    label.textContent = byDay ? stamp.slice(0, 5) : stamp.slice(6, 11);
+    svg.appendChild(label);
+  });
+}
+/** 状态码环形图。 */
+function renderDonut(items){
+  const box = $('#statusDonut');
+  const total = items.reduce((sum, item) => sum + Number(item.requests || 0), 0);
+  if (!total){ box.innerHTML = '<div class="empty">当前时间窗内没有调用</div>'; return; }
+  const palette = ['#3ddc97', '#4c8dff', '#ffb648', '#ff6b6b', '#a78bfa', '#5d6b85'];
+  const R = 54, C = 2 * Math.PI * R;
+  let offset = 0;
+  const svg = svgEl('svg', { viewBox: '0 0 140 140' });
+  svg.appendChild(svgEl('circle', { cx: 70, cy: 70, r: R, fill: 'none', stroke: '#ffffff0d', 'stroke-width': 16 }));
+  items.forEach((item, index) => {
+    const share = Number(item.requests || 0) / total;
+    const arc = svgEl('circle', {
+      cx: 70, cy: 70, r: R, fill: 'none',
+      stroke: palette[index % palette.length], 'stroke-width': 16,
+      'stroke-dasharray': `${arc_len(share)} ${C}`, 'stroke-dashoffset': -offset,
+      transform: 'rotate(-90 70 70)', 'stroke-linecap': 'butt',
+    });
+    const tip = svgEl('title');
+    tip.textContent = `${item.name} · ${num(item.requests)} 次 (${(share * 100).toFixed(1)}%)`;
+    arc.appendChild(tip);
+    svg.appendChild(arc);
+    offset += arc_len(share);
+  });
+  const label = svgEl('text', { x: 70, y: 66, 'text-anchor': 'middle', fill: '#e6ebf5', 'font-size': 19, 'font-weight': 600 });
+  label.textContent = compact(total);
+  const sub = svgEl('text', { x: 70, y: 84, 'text-anchor': 'middle', fill: '#8b98b0', 'font-size': 11 });
+  sub.textContent = '总请求';
+  svg.appendChild(label); svg.appendChild(sub);
+  const legend = items.map((item, index) => `<span><i style="background:${palette[index % palette.length]}"></i>${esc(item.name)} · ${num(item.requests)} · ${(item.requests / total * 100).toFixed(1)}%</span>`).join('');
+  box.innerHTML = '';
+  box.appendChild(svg);
+  const legendBox = document.createElement('div');
+  legendBox.className = 'legend';
+  legendBox.innerHTML = legend;
+  box.appendChild(legendBox);
+}
+function arc_len(share){ return share * 2 * Math.PI * 54; }
+
+/** 横向条形排行榜。 */
+function renderBars(container, items, formatter, emptyText){
+  if (!items || !items.length){ container.innerHTML = `<div class="empty">${emptyText || '暂无数据'}</div>`; return; }
+  const max = Math.max(...items.map(item => Number(item.requests || 0)), 1);
+  container.innerHTML = items.slice(0, 8).map(item => `
+    <div class="bar-row">
+      <span class="name" title="${esc(item.name)}">${esc(item.name)}</span>
+      <span class="num">${formatter(item)}</span>
+      <span class="bar-track"><span class="bar-fill" style="width:${Math.max(2, (Number(item.requests || 0) / max) * 100)}%"></span></span>
+    </div>`).join('');
+}
+
+/* ---------------- KPI 卡片 ---------------- */
+function kpiCard({ label, value, foot, spark, tone }){
+  return `<div class="card kpi">
+    <div class="label">${esc(label)}</div>
+    <div class="value" style="${tone ? 'color:' + tone : ''}">${value}</div>
+    <div class="foot">${foot || ''}</div>
+    ${spark || ''}
+  </div>`;
+}
+function sparkline(series, pick, color){
+  if (!series || series.length < 2) return '';
+  const values = series.map(pick);
+  const max = Math.max(...values, 1);
+  const W = 100, H = 30;
+  const d = values.map((v, i) => `${i === 0 ? 'M' : 'L'}${(i / (values.length - 1)) * W},${H - (v / max) * (H - 4) - 2}`).join(' ');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><path d="${d}" fill="none" stroke="${color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>`;
+}
+function renderKpis(){
+  const s = state.stats;
+  if (!s) return;
+  const series = s.series || [];
+  const html = [
+    kpiCard({ label: '请求数', value: num(s.requests), foot: `成功 ${num(s.requests - s.errors)} · 失败 ${num(s.errors)}`, spark: sparkline(series, d => d.requests, '#4c8dff') }),
+    kpiCard({ label: '总 Token', value: compact(s.total_tokens), foot: `输入 ${compact(s.input_tokens)} · 输出 ${compact(s.output_tokens)}`, spark: sparkline(series, d => d.tokens, '#a78bfa') }),
+    kpiCard({ label: '成功率', value: `<span class="${s.success_rate >= 99 ? 'trend up' : s.success_rate >= 90 ? 'trend flat' : 'trend down'}">${(s.success_rate || 0).toFixed(1)}%</span>`, foot: `错误率 ${(s.error_rate || 0).toFixed(2)}%`, spark: sparkline(series, d => d.errors, '#ff6b6b') }),
+    kpiCard({ label: '平均延迟', value: ms(s.avg_latency_ms), foot: `P95 ${ms(s.p95_latency_ms)}` }),
+    kpiCard({ label: '活跃 API Key', value: num(s.active_keys), foot: `共签发 ${state.keys.length} 个` }),
+    kpiCard({ label: '活跃模型', value: num(s.active_models), foot: `目录 ${state.models.length} 个` }),
+  ].join('');
+  $('#kpis').innerHTML = html;
+  $('#usageKpis').innerHTML = [
+    kpiCard({ label: '窗口内请求', value: num(s.requests), foot: rangeLabel() }),
+    kpiCard({ label: '输入 Token', value: compact(s.input_tokens), foot: 'prompt / input' }),
+    kpiCard({ label: '输出 Token', value: compact(s.output_tokens), foot: 'completion / output' }),
+    kpiCard({ label: '合计 Token', value: compact(s.total_tokens), foot: `平均 ${s.requests ? Math.round(s.total_tokens / s.requests) : 0} / 次` }),
+    kpiCard({ label: '错误数', value: num(s.errors), foot: `成功率 ${(s.success_rate || 0).toFixed(2)}%`, tone: s.errors ? 'var(--bad)' : '' }),
+    kpiCard({ label: '最后调用', value: `<span style="font-size:16px">${agoOf(s.last_activity)}</span>`, foot: timeOf(s.last_activity) }),
+  ].join('');
+}
+function rangeLabel(){
+  const found = $$('#range button').find(b => Number(b.dataset.range) === state.range);
+  return found ? found.textContent.trim() + '窗口' : '';
+}
+
+/* ---------------- 各视图渲染 ---------------- */
+function renderOverview(){
+  const s = state.stats;
+  if (!s) return;
+  renderTrend(s.series);
+  const gap = (s.series || []).length > 1 ? s.series[1].timestamp - s.series[0].timestamp : 3600;
+  $('#trendHint').textContent = gap >= 86_400 ? '按天聚合 · 左轴请求数 / 右轴 Token' : '按小时聚合 · 左轴请求数 / 右轴 Token';
+  renderDonut(s.by_status || []);
+  renderBars($('#topModels'), s.by_model, item => `${num(item.requests)} 次 · ${compact(item.total_tokens)} tok`);
+  renderBars($('#topKeys'), s.by_key.map(item => ({ ...item, name: keyName(item.name) })), item => `${num(item.requests)} 次 · ${compact(item.total_tokens)} tok`);
+  renderBars($('#topEndpoints'), s.by_endpoint, item => `${num(item.requests)} 次 · ${ratePill(item.success_rate)}`);
+  const recent = (s.recent || []).slice(0, 12);
+  $('#recentBody').innerHTML = recent.length ? recent.map(item => `
+    <tr>
+      <td class="mono">${timeOf(item.timestamp)}</td>
+      <td><span class="truncate" title="${esc(item.model)}">${esc(item.model)}</span></td>
+      <td class="mono">${esc(item.endpoint)}</td>
+      <td class="mono">${esc(keyName(item.key_id))}</td>
+      <td>${statusPill(item.status)}</td>
+      <td class="num">${ms(item.latency_ms)}</td>
+      <td class="num">${num(item.input_tokens + item.output_tokens)}</td>
+    </tr>`).join('') : '<tr><td colspan="7"><div class="empty">暂无调用记录</div></td></tr>';
+}
+function keyName(id){
+  const found = state.keys.find(key => key.id === id);
+  return found ? found.name : id;
+}
+function sortItems(items, sort){
+  return [...items].sort((a, b) => {
+    const left = a[sort.key], right = b[sort.key];
+    if (typeof left === 'string' || typeof right === 'string') return String(left).localeCompare(String(right)) * sort.dir;
+    return (Number(left || 0) - Number(right || 0)) * sort.dir;
+  });
+}
+function renderUsageTable(){
+  const s = state.stats;
+  if (!s) return;
+  const items = sortItems(s[state.dimension] || [], state.usageSort);
+  $('#usageBody').innerHTML = items.length ? items.map(item => `
+    <tr>
+      <td><span class="truncate" title="${esc(item.name)}">${esc(state.dimension === 'by_key' ? keyName(item.name) : item.name)}</span></td>
+      <td class="num">${num(item.requests)}</td>
+      <td class="num">${num(item.input_tokens)}</td>
+      <td class="num">${num(item.output_tokens)}</td>
+      <td class="num">${num(item.total_tokens)}</td>
+      <td class="num">${ratePill(item.success_rate)}</td>
+      <td class="num">${ms(item.avg_latency_ms)}</td>
+      <td class="num">${agoOf(item.last_seen)}</td>
+    </tr>`).join('') : '<tr><td colspan="8"><div class="empty">该时间窗内没有调用记录</div></td></tr>';
+  $$('[data-sort]').forEach(th => {
+    if (!th.closest('[data-view="usage"]')) return;
+    const active = th.dataset.sort === state.usageSort.key;
+    th.classList.toggle('sorted', active);
+    const arrow = th.querySelector('.arrow');
+    if (arrow) arrow.textContent = active ? (state.usageSort.dir === 1 ? '↑' : '↓') : '↕';
+  });
+}
+function renderKeys(){
+  const usage = new Map((state.stats?.by_key || []).map(item => [item.name, item]));
+  const items = sortItems(state.keys.map(key => {
+    const stat = usage.get(key.id) || {};
+    return { ...key, requests: stat.requests || 0, tokens: stat.total_tokens || 0 };
+  }), state.keySort);
+  $('#keyCount').textContent = `共 ${state.keys.length} 个（有效 ${state.keys.filter(k => !k.revoked).length} 个）· 统计口径为当前时间窗`;
+  $('#keysBody').innerHTML = items.length ? items.map(key => `
+    <tr>
+      <td>${esc(key.name)}</td>
+      <td><span class="truncate" title="${esc(key.note || '')}">${esc(key.note || '-')}</span></td>
+      <td class="mono"><span class="truncate" title="${esc(key.id)}">${esc(key.id.slice(0, 22))}…</span></td>
+      <td class="mono">${timeOf(key.created_at)}</td>
+      <td>${key.revoked ? '<span class="pill bad">已撤销</span>' : '<span class="pill ok">有效</span>'}</td>
+      <td class="num">${num(key.requests)}</td>
+      <td class="num">${num(key.tokens)}</td>
+      <td style="text-align:right">${key.revoked ? '<span class="pill mute">不可操作</span>' : `
+        <span class="row-actions">
+          <button class="btn sm" data-rename="${esc(key.id)}">改名</button>
+          <button class="btn sm" data-rotate="${esc(key.id)}">轮换</button>
+          <button class="btn sm danger" data-revoke="${esc(key.id)}">撤销</button>
+        </span>`}</td>
+    </tr>`).join('') : '<tr><td colspan="8"><div class="empty">还没有 API Key，先在上方创建一个</div></td></tr>';
+  $$('[data-sort]').forEach(th => {
+    if (!th.closest('[data-view="keys"]')) return;
+    const active = th.dataset.sort === state.keySort.key;
+    th.classList.toggle('sorted', active);
+    const arrow = th.querySelector('.arrow');
+    if (arrow) arrow.textContent = active ? (state.keySort.dir === 1 ? '↑' : '↓') : '↕';
+  });
+  // 日志筛选下拉复用 Key 列表
+  const select = $('#fKey');
+  const current = select.value;
+  select.innerHTML = '<option value="">全部</option>' + state.keys.filter(k => !k.revoked).map(k => `<option value="${esc(k.id)}">${esc(k.name)}</option>`).join('');
+  select.value = current;
+}
+function renderModels(){
+  const usage = new Map((state.stats?.by_model || []).map(item => [item.name, item]));
+  const annotated = state.models.map(model => {
+    const stat = usage.get(model.id) || {};
+    return { ...model, requests: stat.requests || 0, total_tokens: stat.total_tokens || 0, success_rate: stat.success_rate ?? 100, avg_latency_ms: stat.avg_latency_ms || 0 };
+  });
+  const items = sortItems(annotated, state.modelSort);
+  $('#modelHint').textContent = `目录共 ${state.models.length} 个模型；已按当前时间窗标注调用情况`;
+  $('#modelsBody').innerHTML = items.length ? items.map(model => `
+    <tr>
+      <td class="mono"><span class="truncate" title="${esc(model.id)}">${esc(model.id)}</span></td>
+      <td>${model.anthropic ? '<span class="pill info">anthropic</span>' : '<span class="pill mute">openai-responses</span>'}</td>
+      <td class="num">${num(model.requests)}</td>
+      <td class="num">${num(model.total_tokens)}</td>
+      <td class="num">${model.requests ? ratePill(model.success_rate) : '<span class="pill mute">-</span>'}</td>
+      <td class="num">${model.requests ? ms(model.avg_latency_ms) : '-'}</td>
+    </tr>`).join('') : '<tr><td colspan="6"><div class="empty">没有读取到模型目录</div></td></tr>';
+  $$('[data-sort]').forEach(th => {
+    if (!th.closest('[data-view="models"]')) return;
+    const active = th.dataset.sort === state.modelSort.key;
+    th.classList.toggle('sorted', active);
+    const arrow = th.querySelector('.arrow');
+    if (arrow) arrow.textContent = active ? (state.modelSort.dir === 1 ? '↑' : '↓') : '↕';
+  });
+  const endpointSelect = $('#fEndpoint');
+  const current = endpointSelect.value;
+  const endpoints = (state.stats?.by_endpoint || []).map(item => item.name);
+  endpointSelect.innerHTML = '<option value="">全部</option>' + endpoints.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+  endpointSelect.value = endpoints.includes(current) ? current : '';
+}
+function renderLogs(){
+  const { items, total, offset, limit } = state.logs;
+  $('#logHint').textContent = `当前窗口共匹配 ${num(total)} 条 · 服务端分页`;
+  $('#logBody').innerHTML = items.length ? items.map(item => `
+    <tr>
+      <td class="mono">${timeOf(item.timestamp)}</td>
+      <td><span class="truncate" title="${esc(item.model)}">${esc(item.model)}</span></td>
+      <td class="mono">${esc(item.endpoint)}</td>
+      <td class="mono">${esc(keyName(item.key_id))}</td>
+      <td>${statusPill(item.status)}</td>
+      <td class="num">${ms(item.latency_ms)}</td>
+      <td class="num">${num(item.input_tokens)}</td>
+      <td class="num">${num(item.output_tokens)}</td>
+    </tr>`).join('') : '<tr><td colspan="8"><div class="empty">没有符合条件的日志</div></td></tr>';
+  const from = total === 0 ? 0 : offset + 1;
+  const to = Math.min(offset + limit, total);
+  $('#logPageInfo').textContent = `${from} - ${to} / ${num(total)}`;
+  $('#logPrev').disabled = offset <= 0;
+  $('#logNext').disabled = to >= total;
+}
+function renderSystem(){
+  const s = state.stats;
+  const info = s?.system || {};
+  $('#sideBase').textContent = info.base_url || '';
+  $('#sideVersion').textContent = (info.version || 'mk2api') + ' · ' + (info.mode || 'gateway');
+  $('#systemKv').innerHTML = [
+    ['服务版本', esc(info.version || '-')],
+    ['运行模式', esc(info.mode || '-')],
+    ['监听地址', `<span class="mono">${esc(info.listen || '-')}</span>`],
+    ['Base URL', `<span class="mono">${esc(info.base_url || '-')}</span>`],
+    ['鉴权开关', info.auth_required ? '<span class="pill ok">已开启</span>' : '<span class="pill warn">已关闭</span>'],
+    ['TLS', info.tls ? '<span class="pill ok">启用</span>' : '<span class="pill mute">未启用</span>'],
+    ['信任代理', info.trust_proxy ? '是' : '否'],
+    ['IP 白名单', info.allowed_ips?.length ? `<span class="mono">${esc(info.allowed_ips.join(', '))}</span>` : '<span class="pill mute">不限制</span>'],
+    ['已运行', agoOf(info.started_at).replace('前', '')],
+    ['启动时间', timeOf(info.started_at)],
+    ['用量容量', `${num(info.usage_records)} / ${num(info.max_usage_records)} 条`],
+    ['配置文件', `<span class="mono">${esc(info.config_dir || '-')}</span>`],
+  ].map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join('');
+
+  const clients = state.clients;
+  $('#clientsBox').innerHTML = clients ? [
+    ['托管开关', clients.enabled ? '<span class="pill ok">已开启</span>' : '<span class="pill mute">已关闭</span>'],
+    ['目录模型数', num(clients.catalog)],
+    ...(clients.clients || []).flatMap(client => [
+      [client.name, client.managed ? `<span class="pill ok">已托管 · ${num(client.models)} 个模型</span>` : `<span class="pill mute">${esc(client.message || '未托管')}</span>`],
+    ]),
+  ].map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join('') : '<div>未加载</div>';
+
+  $('#connectKv').innerHTML = [
+    ['Base URL', `<span class="mono">${esc(info.base_url || '-')}</span>`],
+    ['鉴权方式', '<span class="mono">Authorization: Bearer &lt;API Key&gt;</span>'],
+    ['Responses', '<span class="mono">POST /v1/responses</span>'],
+    ['Chat Completions', '<span class="mono">POST /v1/chat/completions</span>'],
+    ['模型列表', '<span class="mono">GET /v1/models</span>'],
+  ].map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join('');
+  $('#curlSample').textContent = `curl ${info.base_url || 'http://127.0.0.1:8123/v1'}/chat/completions \\
+  -H "Authorization: Bearer $MK2API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"gpt-5.2-codex","messages":[{"role":"user","content":"ping"}]}'`;
+}
+function renderAll(){
+  renderKpis();
+  renderOverview();
+  renderUsageTable();
+  renderKeys();
+  renderModels();
+  renderLogs();
+  renderSystem();
+}
+
+/* ---------------- 数据加载 ---------------- */
+async function loadStats(){
+  const data = await api('/v1/admin/stats?window=' + state.range);
+  state.stats = data;
+}
+async function loadKeys(){
+  const data = await api('/v1/admin/keys');
+  state.keys = data.data || [];
+}
+async function loadModels(){
+  try {
+    const data = await api('/v1/admin/models');
+    state.models = data.data || [];
+  } catch {
+    // 模型目录依赖上游配置，读取失败时退化成从用量里推断，避免整页报错
+    const seen = new Map();
+    for (const item of state.stats?.by_model || []) seen.set(item.name, { id: item.name, anthropic: /deepseek|claude|anthropic/i.test(item.name) });
+    state.models = Array.from(seen.values());
+  }
+}
+async function loadClients(){
+  try { state.clients = await api('/v1/admin/clients'); } catch { state.clients = null; }
+}
+async function loadLogs(){
+  const f = state.logs.filters;
+  const params = new URLSearchParams({
+    window: String(state.range),
+    limit: String(state.logs.limit),
+    offset: String(state.logs.offset),
+  });
+  if (f.keyword) params.set('keyword', f.keyword);
+  if (f.key_id) params.set('key_id', f.key_id);
+  if (f.endpoint) params.set('endpoint', f.endpoint);
+  if (f.status) params.set('status', f.status);
+  const data = await api('/v1/admin/logs?' + params.toString());
+  state.logs.items = data.data || [];
+  state.logs.total = data.total || 0;
+  renderLogs();
+}
+async function refreshAll(silent){
+  try {
+    await loadStats();
+    await Promise.all([loadKeys(), loadModels()]);
+    renderAll();
+    if (!silent) toast('已刷新 · ' + new Date().toLocaleTimeString());
+  } catch (error) {
+    if (error.status === 401) return logout('Admin Key 无效或已失效，请重新登录');
+    if (!silent) toast(error.message, 'bad');
+  }
+}
+
+/* ---------------- 视图切换 ---------------- */
+const VIEWS = {
+  overview: ['概览', '实时用量、趋势与排行'],
+  usage: ['用量分析', '按模型 / Key / 端点 / 状态码聚合'],
+  keys: ['API Key', '签发、轮换与撤销调用凭证'],
+  models: ['模型', '上游模型目录与调用表现'],
+  logs: ['调用日志', '逐条请求明细，支持筛选与分页'],
+  system: ['系统信息', '服务状态、客户端托管与接入方式'],
+};
+function switchView(view){
+  state.view = view;
+  $$('#nav button').forEach(button => button.classList.toggle('active', button.dataset.view === view));
+  $$('section[data-view]').forEach(section => section.classList.toggle('hidden', section.dataset.view !== view));
+  const [title, sub] = VIEWS[view] || ['控制台', ''];
+  $('#viewTitle').textContent = title;
+  $('#viewSub').textContent = sub;
+  if (view === 'logs') loadLogs().catch(error => toast(error.message, 'bad'));
+  if (view === 'system') loadClients().then(renderSystem).catch(() => {});
+  if (view === 'overview' || view === 'usage') setTimeout(() => renderTrend(state.stats?.series || []), 0);
+}
+
+/* ---------------- 事件绑定 ---------------- */
+function bind(){
+  $('#gateLogin').addEventListener('click', tryLogin);
+  $('#gateKey').addEventListener('keydown', event => { if (event.key === 'Enter') tryLogin(); });
+  $('#gateClear').addEventListener('click', () => { localStorage.removeItem(KEY_STORAGE); $('#gateKey').value = ''; $('#gateMsg').textContent = '已清除本地保存的 Admin Key。'; });
+  $('#logout').addEventListener('click', event => { event.preventDefault(); logout('已退出登录'); });
+
+  $('#nav').addEventListener('click', event => {
+    const button = event.target.closest('button[data-view]');
+    if (button) switchView(button.dataset.view);
+  });
+  document.addEventListener('click', event => {
+    const goto = event.target.closest('[data-goto]');
+    if (goto) switchView(goto.dataset.goto);
+  });
+  $('#range').addEventListener('click', event => {
+    const button = event.target.closest('button[data-range]');
+    if (!button) return;
+    $$('#range button').forEach(item => item.classList.toggle('active', item === button));
+    state.range = Number(button.dataset.range);
+    state.logs.offset = 0;
+    refreshAll().then(() => { if (state.view === 'logs') loadLogs(); });
+  });
+  $('#dimension').addEventListener('click', event => {
+    const button = event.target.closest('button[data-dim]');
+    if (!button) return;
+    $$('#dimension button').forEach(item => item.classList.toggle('active', item === button));
+    state.dimension = button.dataset.dim;
+    renderUsageTable();
+  });
+  $$('[data-view="usage"] th.sortable, [data-view="keys"] th.sortable, [data-view="models"] th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const scope = th.closest('section').dataset.view;
+      const sortKey = scope === 'usage' ? 'usageSort' : scope === 'keys' ? 'keySort' : 'modelSort';
+      const sort = state[sortKey];
+      if (sort.key === th.dataset.sort) sort.dir *= -1;
+      else { sort.key = th.dataset.sort; sort.dir = -1; }
+      if (scope === 'usage') renderUsageTable();
+      if (scope === 'keys') renderKeys();
+      if (scope === 'models') renderModels();
+    });
+  });
+  $('#refreshNow').addEventListener('click', () => refreshAll());
+  $('#refresh').addEventListener('change', event => {
+    if (state.timer) clearInterval(state.timer);
+    const interval = Number(event.target.value);
+    if (interval > 0) state.timer = setInterval(() => refreshAll(true), interval);
+  });
+
+  // Key 管理
+  $('#createKey').addEventListener('click', async () => {
+    const name = $('#newKeyName').value.trim();
+    if (!name) return toast('请先填写 Key 名称', 'warn');
+    try {
+      const data = await api('/v1/admin/keys', { method: 'POST', body: JSON.stringify({ name, note: $('#newKeyNote').value.trim() }) });
+      $('#newKeyName').value = ''; $('#newKeyNote').value = '';
+      showSecret('新 API Key 创建成功', data.key);
+      await loadKeys(); renderKeys();
+      toast('已创建 ' + name);
+    } catch (error) { toast(error.message, 'bad'); }
+  });
+  $('#reloadKeys').addEventListener('click', () => loadKeys().then(renderKeys).catch(error => toast(error.message, 'bad')));
+  $('#keysBody').addEventListener('click', async event => {
+    const rotate = event.target.closest('[data-rotate]');
+    const revoke = event.target.closest('[data-revoke]');
+    const rename = event.target.closest('[data-rename]');
+    try {
+      if (rotate) {
+        if (!confirm('轮换后旧 Key 立即失效，确认继续？')) return;
+        const data = await api('/v1/admin/keys/' + encodeURIComponent(rotate.dataset.rotate) + '/rotate', { method: 'POST' });
+        showSecret('已轮换，请替换客户端配置', data.key);
+        await loadKeys(); renderKeys();
+      }
+      if (revoke) {
+        if (!confirm('撤销后该 Key 立即失效，确认继续？')) return;
+        await api('/v1/admin/keys/' + encodeURIComponent(revoke.dataset.revoke), { method: 'DELETE' });
+        await loadKeys(); renderKeys();
+        toast('已撤销该 Key');
+      }
+      if (rename) {
+        const target = state.keys.find(key => key.id === rename.dataset.rename);
+        const name = prompt('新的名称', target?.name || '');
+        if (name === null) return;
+        const note = prompt('新的备注（可留空）', target?.note || '');
+        if (note === null) return;
+        await api('/v1/admin/keys/' + encodeURIComponent(rename.dataset.rename), { method: 'PATCH', body: JSON.stringify({ name, note }) });
+        await loadKeys(); renderKeys();
+        toast('已更新 Key 信息');
+      }
+    } catch (error) { toast(error.message, 'bad'); }
+  });
+  function showSecret(title, value){
+    $('#secretBox').innerHTML = `<div class="card" style="margin-top:14px"><div class="card-head"><div><h3>${esc(title)}</h3><div class="hint">关闭本页面后将无法再次查看明文</div></div>
+      <button class="btn sm" id="copySecret">复制</button></div><div class="secret"><span class="value">${esc(value)}</span></div></div>`;
+    $('#copySecret').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(value); toast('已复制到剪贴板'); }
+      catch { toast('复制失败，请手动选择文本', 'warn'); }
+    });
+  }
+
+  // 日志筛选
+  $('#logApply').addEventListener('click', () => {
+    state.logs.offset = 0;
+    state.logs.filters = {
+      keyword: $('#fKeyword').value.trim(),
+      key_id: $('#fKey').value,
+      endpoint: $('#fEndpoint').value,
+      status: $('#fStatus').value.trim(),
+    };
+    loadLogs().catch(error => toast(error.message, 'bad'));
+  });
+  $('#logReset').addEventListener('click', () => {
+    $('#fKeyword').value = ''; $('#fKey').value = ''; $('#fEndpoint').value = ''; $('#fStatus').value = '';
+    state.logs.offset = 0; state.logs.filters = {};
+    loadLogs().catch(error => toast(error.message, 'bad'));
+  });
+  $('#fKeyword').addEventListener('keydown', event => { if (event.key === 'Enter') $('#logApply').click(); });
+  $('#logPrev').addEventListener('click', () => { state.logs.offset = Math.max(0, state.logs.offset - state.logs.limit); loadLogs().catch(error => toast(error.message, 'bad')); });
+  $('#logNext').addEventListener('click', () => { state.logs.offset += state.logs.limit; loadLogs().catch(error => toast(error.message, 'bad')); });
+  $('#fLimit').addEventListener('change', event => { state.logs.limit = Number(event.target.value); state.logs.offset = 0; loadLogs().catch(error => toast(error.message, 'bad')); });
+  $('#syncClients').addEventListener('click', async () => {
+    try { state.clients = await api('/v1/admin/clients/sync', { method: 'POST' }); renderSystem(); toast('客户端配置已同步'); }
+    catch (error) { toast(error.message, 'bad'); }
+  });
+  window.addEventListener('resize', () => { if (state.view === 'overview' || state.view === 'usage') renderTrend(state.stats?.series || []); });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'r' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); refreshAll(); }
+  });
+}
+
+/* ---------------- 登录流程 ---------------- */
+async function tryLogin(){
+  const value = $('#gateKey').value.trim();
+  if (!value) return toast('请输入 Admin Key', 'warn');
+  state.adminKey = value;
+  try {
+    await api('/v1/admin/stats?window=86400');
+    localStorage.setItem(KEY_STORAGE, value);
+    $('#gateMsg').textContent = '';
+    enter();
+  } catch (error) {
+    localStorage.removeItem(KEY_STORAGE);
+    $('#gateMsg').innerHTML = `<span style="color:var(--bad)">${esc(error.message)}</span>`;
+  }
+}
+function logout(message){
+  localStorage.removeItem(KEY_STORAGE);
+  state.adminKey = '';
+  $('#shell').classList.add('hidden');
+  $('#gate').classList.remove('hidden');
+  $('#gateKey').value = '';
+  if (message) $('#gateMsg').textContent = message;
+}
+async function enter(){
+  $('#gate').classList.add('hidden');
+  $('#shell').classList.remove('hidden');
+  await refreshAll(true);
+  if (state.view === 'logs') loadLogs().catch(() => {});
+  if (state.timer) clearInterval(state.timer);
+  const interval = Number($('#refresh').value);
+  if (interval > 0) state.timer = setInterval(() => refreshAll(true), interval);
+  toast('已连接本地网关');
+}
+
+/* ---------------- 启动 ---------------- */
+// 事件只绑定一次：闸门与主界面元素始终存在于 DOM 中，重复绑定会导致请求与提示翻倍。
+(function boot(){
+  bind();
+  if (state.adminKey){
+    api('/v1/admin/stats?window=86400').then(enter).catch(() => logout('本地保存的 Admin Key 已失效，请重新输入'));
+  } else {
+    $('#gateKey').focus();
+  }
+})();
+</script>
+</body>
+</html>

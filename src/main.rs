@@ -27,6 +27,7 @@ use uuid::Uuid;
 mod anthropic;
 mod cli;
 mod clients;
+mod dashboard;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -67,6 +68,7 @@ struct AppState {
     admin_key: Arc<String>,
     api_keys: Arc<Mutex<ApiKeyStore>>,
     usage: Arc<Mutex<UsageStore>>,
+    started_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +78,7 @@ struct ApiKeyRecord {
     key_hash: String,
     created_at: u64,
     revoked: bool,
+    note: String,
 }
 
 struct ApiKeyStore {
@@ -93,6 +96,61 @@ struct UsageRecord {
     latency_ms: u64,
     input_tokens: u64,
     output_tokens: u64,
+}
+
+/// 单组统计累加器。
+///
+/// 中文说明：看板需要同时展示「请求数 / 输入 token / 输出 token / 错误数 / 平均延迟 / 最高延迟 /
+/// 最后一次调用时间」，为了避免在多个维度（API Key、模型、端点、状态码）上重复写四份几乎相同的
+/// 代码，这里统一用一个结构体承载。
+#[derive(Default, Clone, Copy)]
+struct GroupTotals {
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    errors: u64,
+    latency_total: u64,
+    latency_max: u64,
+    last_seen: u64,
+}
+
+impl GroupTotals {
+    fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    fn avg_latency(&self) -> u64 {
+        if self.requests == 0 {
+            0
+        } else {
+            self.latency_total / self.requests
+        }
+    }
+
+    fn success_rate(&self) -> f64 {
+        if self.requests == 0 {
+            100.0
+        } else {
+            let ok = self.requests - self.errors;
+            (ok as f64) * 100.0 / (self.requests as f64)
+        }
+    }
+
+    /// 输出成前端直接可用的 JSON。
+    fn to_json(&self, name: &str) -> Value {
+        json!({
+            "name": name,
+            "requests": self.requests,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens(),
+            "errors": self.errors,
+            "success_rate": (self.success_rate() * 100.0).round() / 100.0,
+            "avg_latency_ms": self.avg_latency(),
+            "max_latency_ms": self.latency_max,
+            "last_seen": self.last_seen,
+        })
+    }
 }
 
 struct UsageStore {
@@ -263,6 +321,7 @@ impl ApiKeyStore {
                     key_hash: item.get("key_hash")?.as_str()?.to_string(),
                     created_at: item.get("created_at").and_then(Value::as_u64).unwrap_or(0),
                     revoked: item.get("revoked").and_then(Value::as_bool).unwrap_or(false),
+                    note: item.get("note").and_then(Value::as_str).unwrap_or("").to_string(),
                 })).collect()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -274,13 +333,13 @@ impl ApiKeyStore {
     fn serialized(&self) -> Result<String, BoxError> {
         let value = json!({"keys": self.keys.iter().map(|key| json!({
             "id": key.id, "name": key.name, "key_hash": key.key_hash,
-            "created_at": key.created_at, "revoked": key.revoked,
+            "created_at": key.created_at, "revoked": key.revoked, "note": key.note,
         })).collect::<Vec<_>>()});
         Ok(serde_json::to_string_pretty(&value)?)
     }
 
     fn public_key(key: &ApiKeyRecord) -> Value {
-        json!({"id": key.id, "name": key.name, "created_at": key.created_at, "revoked": key.revoked})
+        json!({"id": key.id, "name": key.name, "created_at": key.created_at, "revoked": key.revoked, "note": key.note})
     }
 }
 
@@ -318,19 +377,144 @@ impl UsageStore {
         Ok((self.path.clone(), serde_json::to_string(&value)?))
     }
 
-    fn summary(&self) -> Value {
-        let mut by_key: std::collections::BTreeMap<String, [u64; 4]> = std::collections::BTreeMap::new();
-        let mut by_model: std::collections::BTreeMap<String, [u64; 4]> = std::collections::BTreeMap::new();
-        let mut requests = 0u64; let mut input = 0u64; let mut output = 0u64;
-        for item in &self.records {
-            requests += 1; input += item.input_tokens; output += item.output_tokens;
-            for (group, key) in [(&mut by_key, &item.key_id), (&mut by_model, &item.model)] {
-                let totals = group.entry(key.clone()).or_insert([0; 4]);
-                totals[0] += 1; totals[1] += item.input_tokens; totals[2] += item.output_tokens; totals[3] += u64::from(item.status >= 400);
-            }
+    /// 时间窗内的起始时间戳。
+    ///
+    /// 中文说明：`window_seconds == 0` 表示「全部时间」，此时返回 0（而不是 now），
+    /// 否则会得到空集合；其余情况返回 `now - window`，并做饱和减法避免回绕。
+    fn window_start(&self, window_seconds: u64, now_ts: u64) -> u64 {
+        if window_seconds == 0 {
+            0
+        } else {
+            now_ts.saturating_sub(window_seconds)
         }
-        let groups = |values: std::collections::BTreeMap<String, [u64; 4]>| values.into_iter().map(|(name, totals)| json!({"name": name, "requests": totals[0], "input_tokens": totals[1], "output_tokens": totals[2], "errors": totals[3]})).collect::<Vec<_>>();
-        json!({"requests": requests, "input_tokens": input, "output_tokens": output, "total_tokens": input + output, "by_key": groups(by_key), "by_model": groups(by_model), "recent": self.records.iter().rev().take(50).map(|item| json!({"timestamp": item.timestamp, "key_id": item.key_id, "model": item.model, "endpoint": item.endpoint, "status": item.status, "latency_ms": item.latency_ms, "input_tokens": item.input_tokens, "output_tokens": item.output_tokens})).collect::<Vec<_>>()})
+    }
+
+    /// 通用分组聚合：按调用方给出的字段（Key / 模型 / 端点 / 状态码）累计统计。
+    fn totals_by<F>(&self, window_seconds: u64, now_ts: u64, pick: F) -> std::collections::BTreeMap<String, GroupTotals>
+    where
+        F: Fn(&UsageRecord) -> String,
+    {
+        let since = self.window_start(window_seconds, now_ts);
+        let mut map: std::collections::BTreeMap<String, GroupTotals> = std::collections::BTreeMap::new();
+        for item in self.records.iter().filter(|item| item.timestamp >= since) {
+            let totals = map.entry(pick(item)).or_default();
+            totals.requests += 1;
+            totals.input_tokens += item.input_tokens;
+            totals.output_tokens += item.output_tokens;
+            // 约定：HTTP 状态码 >= 400 一律计入错误（含 401/403/429/5xx）。
+            totals.errors += u64::from(item.status >= 400);
+            totals.latency_total += item.latency_ms;
+            totals.latency_max = totals.latency_max.max(item.latency_ms);
+            totals.last_seen = totals.last_seen.max(item.timestamp);
+        }
+        map
+    }
+
+    /// 把分组结果按请求量倒序（同量按名称升序）转成数组，便于前端直接渲染排行榜。
+    fn totals_json(map: &std::collections::BTreeMap<String, GroupTotals>) -> Vec<Value> {
+        let mut items: Vec<Value> = map.iter().map(|(name, totals)| totals.to_json(name)).collect();
+        items.sort_by(|left, right| {
+            let left_requests = left.get("requests").and_then(Value::as_u64).unwrap_or(0);
+            let right_requests = right.get("requests").and_then(Value::as_u64).unwrap_or(0);
+            right_requests.cmp(&left_requests).then_with(|| {
+                left.get("name").and_then(Value::as_str).unwrap_or("").cmp(right.get("name").and_then(Value::as_str).unwrap_or(""))
+            })
+        });
+        items
+    }
+
+    /// P95 延迟（毫秒）。数据量不大时直接排序取分位，避免引入额外依赖。
+    fn percentile(values: &mut [u64], ratio: f64) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        values.sort_unstable();
+        let index = (((values.len() - 1) as f64) * ratio).round() as usize;
+        values[index.min(values.len() - 1)]
+    }
+
+    /// 数据看板主统计。
+    ///
+    /// 中文说明：这里替换了早期 `summary()` 的实现。旧 `summary()` 只返回全局总量和按 Key / 模型
+    /// 的分组，缺少时间序列、延迟分位、状态码分布、端点分布，无法支撑图表化看板；
+    /// 新实现保留 `recent` 字段以兼容旧的 TUI 与脚本调用方，同时新增看板所需的全部维度。
+    fn stats(&self, window_seconds: u64, now_ts: u64) -> Value {
+        let since = self.window_start(window_seconds, now_ts);
+        let mut latencies: Vec<u64> = Vec::new();
+        let mut requests = 0u64;
+        let mut input_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut errors = 0u64;
+        let mut latency_total = 0u64;
+        let mut last_activity = 0u64;
+        for item in self.records.iter().filter(|item| item.timestamp >= since) {
+            requests += 1;
+            input_tokens += item.input_tokens;
+            output_tokens += item.output_tokens;
+            errors += u64::from(item.status >= 400);
+            latency_total += item.latency_ms;
+            latencies.push(item.latency_ms);
+            last_activity = last_activity.max(item.timestamp);
+        }
+
+        // 时间序列自适应粒度：<= 3 天按小时，超过则按天，保证图表点数可控（<= ~90 个点）。
+        let bucket_seconds: u64 = if window_seconds > 3 * 86_400 { 86_400 } else { 3_600 };
+        let bucket_count = ((window_seconds / bucket_seconds).max(1)) as usize;
+        let series_start = since / bucket_seconds * bucket_seconds;
+        let mut series = vec![(0u64, 0u64, 0u64); bucket_count];
+        for item in self.records.iter().filter(|item| item.timestamp >= since) {
+            let index = ((item.timestamp.saturating_sub(series_start)) / bucket_seconds) as usize;
+            let slot = &mut series[index.min(bucket_count - 1)];
+            slot.0 += 1;
+            slot.1 += item.input_tokens + item.output_tokens;
+            slot.2 += u64::from(item.status >= 400);
+        }
+        let series: Vec<Value> = series
+            .iter()
+            .enumerate()
+            .map(|(index, (bucket_requests, bucket_tokens, bucket_errors))| {
+                json!({
+                    "timestamp": series_start + (index as u64) * bucket_seconds,
+                    "requests": bucket_requests,
+                    "tokens": bucket_tokens,
+                    "errors": bucket_errors,
+                })
+            })
+            .collect();
+
+        let by_key = self.totals_by(window_seconds, now_ts, |item| item.key_id.clone());
+        let by_model = self.totals_by(window_seconds, now_ts, |item| item.model.clone());
+        let by_endpoint = self.totals_by(window_seconds, now_ts, |item| item.endpoint.clone());
+        let by_status = self.totals_by(window_seconds, now_ts, |item| item.status.to_string());
+        let p95 = Self::percentile(&mut latencies, 0.95);
+        let avg_latency = if requests == 0 { 0 } else { latency_total / requests };
+        let error_rate = if requests == 0 { 0.0 } else { (errors as f64) * 100.0 / (requests as f64) };
+        let success_rate = 100.0 - error_rate;
+
+        json!({
+            "window_seconds": window_seconds,
+            "generated_at": now_ts,
+            "requests": requests,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "errors": errors,
+            // error_rate / success_rate 保留两位小数，避免前端再格式化。
+            "error_rate": (error_rate * 100.0).round() / 100.0,
+            "success_rate": (success_rate * 100.0).round() / 100.0,
+            "avg_latency_ms": avg_latency,
+            "p95_latency_ms": p95,
+            "active_keys": by_key.values().filter(|totals| totals.requests > 0).count(),
+            "active_models": by_model.values().filter(|totals| totals.requests > 0).count(),
+            "last_activity": last_activity,
+            "series": series,
+            "by_key": Self::totals_json(&by_key),
+            "by_model": Self::totals_json(&by_model),
+            "by_endpoint": Self::totals_json(&by_endpoint),
+            "by_status": Self::totals_json(&by_status),
+            // recent 保持旧字段形态，兼容 `mk2api` TUI 与既有脚本。
+            "recent": self.records.iter().rev().take(50).map(|item| json!({"timestamp": item.timestamp, "key_id": item.key_id, "model": item.model, "endpoint": item.endpoint, "status": item.status, "latency_ms": item.latency_ms, "input_tokens": item.input_tokens, "output_tokens": item.output_tokens})).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -457,34 +641,52 @@ fn admin_authorized(request: &Request<Body>, state: &AppState) -> bool {
     safe_equal(bearer_token(request), state.admin_key.as_ref().as_str())
 }
 
-fn html_response(body: &str) -> Response {
-    let mut response = Response::new(Body::from(body.to_string()));
+/// 站点图标。
+///
+/// 中文说明：浏览器会自动请求 `/favicon.ico`。网关对所有未匹配路径返回 401/404，
+/// 会让控制台每次刷新都报一条“加载资源失败”的噪声错误，所以这里直接内联一个小 SVG 图标——
+/// 既不引入二进制资源，也不影响单文件构建。
+fn favicon() -> Response {
+    const ICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0b0e14"/><circle cx="32" cy="32" r="9" fill="#4c8dff"/><circle cx="32" cy="32" r="17" fill="none" stroke="#4c8dff" stroke-opacity=".4" stroke-width="3"/><circle cx="32" cy="32" r="25" fill="none" stroke="#a78bfa" stroke-opacity=".25" stroke-width="3"/></svg>"##;
+    let mut response = Response::new(Body::from(ICON));
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
     response
 }
 
-fn admin_page() -> Response {
-    html_response(r##"<!doctype html>
-<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MonkeyCode API Key 管理</title>
-<style>
-body{font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:960px;margin:40px auto;padding:0 20px;color:#202124;background:#f7f7f8}main{background:white;padding:28px;border-radius:14px;box-shadow:0 4px 24px #0001}h1{margin-top:0}input,button{font:inherit;padding:9px 12px;border:1px solid #ccd0d5;border-radius:7px}input{width:min(520px,90%)}button{cursor:pointer;background:#202124;color:white;margin-left:6px}.danger{background:#b42318}.key{font-family:monospace;word-break:break-all;background:#fff8d6;padding:12px;border-radius:7px}.muted{color:#6b7280}table{width:100%;border-collapse:collapse;margin-top:22px}td,th{text-align:left;padding:11px 7px;border-bottom:1px solid #eee}code{font-family:monospace}.hidden{display:none}
-</style><main><h1>API Key 管理</h1><p class="muted">Admin Key 只保存在本浏览器，不会发送到第三方服务。</p>
-<p><input id="admin" type="password" placeholder="输入 Admin Key"><button onclick="loadKeys()">登录 / 刷新</button></p>
-<section id="app" class="hidden"><p><input id="name" placeholder="Key 名称，例如 production-app"><button onclick="createKey()">创建 API Key</button><button onclick="loadUsage()">刷新用量</button></p><div id="new" class="hidden"></div><div id="usage" class="muted"></div><pre id="usage_detail" class="muted"></pre><table><thead><tr><th>名称</th><th>ID</th><th>创建时间</th><th>状态</th><th>操作</th></tr></thead><tbody id="keys"></tbody></table></section><p id="msg" class="muted"></p></main>
-<script>
-const admin=document.querySelector('#admin'),msg=document.querySelector('#msg'); admin.value=localStorage.getItem('monkeycode_admin_key')||'';
-function auth(){return {Authorization:'Bearer '+admin.value,'Content-Type':'application/json'}}
-async function api(url,opt={}){let r=await fetch(url,{...opt,headers:{...auth(),...(opt.headers||{})}});let j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error?.message||('HTTP '+r.status));return j}
-async function loadKeys(){try{localStorage.setItem('monkeycode_admin_key',admin.value);let j=await api('/v1/admin/keys');document.querySelector('#app').classList.remove('hidden');document.querySelector('#keys').innerHTML=j.data.map(k=>`<tr><td>${esc(k.name)}</td><td><code>${esc(k.id)}</code></td><td>${new Date(k.created_at*1000).toLocaleString()}</td><td>${k.revoked?'已撤销':'有效'}</td><td>${k.revoked?'':`<button onclick="rotate('${k.id}')">轮换</button><button class="danger" onclick="revoke('${k.id}')">撤销</button>`}</td></tr>`).join('');msg.textContent='已加载 '+j.data.length+' 个 Key';await loadUsage()}catch(e){msg.textContent=e.message}}
-async function loadUsage(){try{let j=await api('/v1/admin/usage');document.querySelector('#usage_detail').textContent='按 Key:\n'+j.by_key.map(x=>`${x.name}: ${x.requests} 次 / ${x.input_tokens+x.output_tokens} tokens / 错误 ${x.errors}`).join('\n')+'\n\n按模型:\n'+j.by_model.map(x=>`${x.name}: ${x.requests} 次 / ${x.input_tokens+x.output_tokens} tokens / 错误 ${x.errors}`).join('\n'); }catch(e){msg.textContent=e.message}}
-async function createKey(){try{let j=await api('/v1/admin/keys',{method:'POST',body:JSON.stringify({name:document.querySelector('#name').value})});let n=document.querySelector('#new');n.classList.remove('hidden');n.innerHTML='<p>请立即复制，关闭页面后不会再次显示：</p><div class="key">'+esc(j.key)+'</div>';document.querySelector('#name').value='';await loadKeys()}catch(e){msg.textContent=e.message}}
-async function rotate(id){if(!confirm('轮换后旧 Key 会立即失效，确认继续？'))return;try{let j=await api('/v1/admin/keys/'+encodeURIComponent(id)+'/rotate',{method:'POST'});let n=document.querySelector('#new');n.classList.remove('hidden');n.innerHTML='<p>新 Key（旧 Key 已失效，请立即复制）：</p><div class="key">'+esc(j.key)+'</div>';await loadKeys()}catch(e){msg.textContent=e.message}}
-async function revoke(id){if(!confirm('撤销后该 Key 将立即失效，确认继续？'))return;try{await api('/v1/admin/keys/'+encodeURIComponent(id),{method:'DELETE'});await loadKeys()}catch(e){msg.textContent=e.message}}
-function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-</script></html>"##)
+/// 解析 URL 查询串。
+///
+/// 中文说明：看板只用几个简单参数，引入 `serde_urlencoded` 之类依赖并不划算，
+/// 这里做最小实现：按 `&`/`=` 切分，并处理 `%XX` 百分号编码与 `+` 空格。
+fn query_params(uri: &axum::http::Uri) -> std::collections::HashMap<String, String> {
+    let mut params = std::collections::HashMap::new();
+    let Some(query) = uri.query() else { return params; };
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(percent_decode(key), percent_decode(value));
+    }
+    params
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok().and_then(|hex| u8::from_str_radix(hex, 16).ok());
+                match hex {
+                    Some(byte) => { output.push(byte); index += 3; }
+                    None => { output.push(bytes[index]); index += 1; }
+                }
+            }
+            b'+' => { output.push(b' '); index += 1; }
+            byte => { output.push(byte); index += 1; }
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Option<&str>, action: &str) -> Response {
@@ -500,8 +702,10 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
         let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => return e.into_response() };
         let name = body.get("name").and_then(Value::as_str).unwrap_or("Unnamed key").trim();
         if name.is_empty() { return GatewayError::new(StatusCode::BAD_REQUEST, "name must not be empty").into_response(); }
+        // note 为可选备注字段，看板用它标记 Key 用途（如「给同事 A」）。
+        let note = body.get("note").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let raw_key = new_api_key();
-        let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name: name.to_string(), key_hash: hash_key(&raw_key), created_at: now(), revoked: false };
+        let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name: name.to_string(), key_hash: hash_key(&raw_key), created_at: now(), revoked: false, note };
         let public = ApiKeyStore::public_key(&record);
         let save_snapshot = {
             let mut store = state.api_keys.lock().await;
@@ -518,9 +722,10 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
             let mut store = state.api_keys.lock().await;
             let Some(index) = store.keys.iter().position(|key| key.id == key_id) else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
             let name = store.keys[index].name.clone();
+            let note = store.keys[index].note.clone();
             store.keys[index].revoked = true;
             let raw_key = new_api_key();
-            let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name, key_hash: hash_key(&raw_key), created_at: now(), revoked: false };
+            let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name, key_hash: hash_key(&raw_key), created_at: now(), revoked: false, note };
             let public = ApiKeyStore::public_key(&record);
             store.keys.push(record);
             let snapshot = store.serialized().map(|contents| (store.path.clone(), contents));
@@ -541,6 +746,29 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
         };
         let (public, snapshot) = match save_snapshot { Ok(value) => value, Err(e) => return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot serialize API key: {e}")).into_response() };
         let (path, contents) = snapshot;
+        if let Err(e) = write_private(&path, &contents).await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).into_response(); }
+        return json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, json!({"data": public}));
+    }
+    if action == "edit" {
+        // 重命名 / 修改备注 / 恢复启用。看板用 PATCH 调这个分支。
+        let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => return e.into_response() };
+        let public = {
+            let mut store = state.api_keys.lock().await;
+            let Some(index) = store.keys.iter().position(|key| key.id == key_id) else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
+            if let Some(name) = body.get("name").and_then(Value::as_str) {
+                let name = name.trim();
+                if name.is_empty() { return GatewayError::new(StatusCode::BAD_REQUEST, "name must not be empty").into_response(); }
+                store.keys[index].name = name.to_string();
+            }
+            if let Some(note) = body.get("note").and_then(Value::as_str) { store.keys[index].note = note.trim().to_string(); }
+            if let Some(revoked) = body.get("revoked").and_then(Value::as_bool) { store.keys[index].revoked = revoked; }
+            ApiKeyStore::public_key(&store.keys[index])
+        };
+        let snapshot = {
+            let store = state.api_keys.lock().await;
+            store.serialized().map(|contents| (store.path.clone(), contents))
+        };
+        let (path, contents) = match snapshot { Ok(value) => value, Err(e) => return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot serialize API key: {e}")).into_response() };
         if let Err(e) = write_private(&path, &contents).await { return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save API key: {e}")).into_response(); }
         return json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, json!({"data": public}));
     }
@@ -747,6 +975,26 @@ async fn configured_model_ids(config: &Config) -> Result<Vec<String>, GatewayErr
         if !ids.contains(&short) { ids.push(short); }
     }
     Ok(ids)
+}
+
+/// 模型目录：`(模型 id, 是否为 anthropic 协议)`。
+///
+/// 与 `configured_model_ids()` 的差别：后者只给调用方一串 id（用于写客户端配置），
+/// 这里额外带上协议类型，供看板「模型」页展示并区分 `/responses` 与 `/messages` 路由。
+async fn configured_model_catalog(config: &Config) -> Vec<(String, bool)> {
+    let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
+    let (Ok(key_config), Ok(settings)) = (key_config, settings) else { return Vec::new(); };
+    let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
+    let mut catalog: Vec<(String, bool)> = Vec::new();
+    for entry in models_for_upstream(&settings, &base_url) {
+        let Some(id) = entry.get("model").and_then(Value::as_str) else { continue; };
+        let is_anthropic = anthropic::is_anthropic_type(entry.get("type").and_then(Value::as_str));
+        let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1);
+        // 完整 id 与短别名都登记；重名时以先出现的为准，保证顺序稳定。
+        if !catalog.iter().any(|(existing, _)| existing == id) { catalog.push((id.to_string(), is_anthropic)); }
+        if short != id && !catalog.iter().any(|(existing, _)| existing == &short) { catalog.push((short, is_anthropic)); }
+    }
+    catalog
 }
 
 async fn request_upstream(state: &AppState, outgoing: &Value, runtime: &Runtime) -> Result<reqwest::Response, GatewayError> {
@@ -962,14 +1210,64 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     }
 }
 
-async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response {
-    if !admin_authorized(&request, &state) { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key")); }
+/// 看板主统计：`GET /v1/admin/stats?window=<秒>`。
+///
+/// `window=0` 表示全部时间；旧的无参数形式等价于 24 小时。
+async fn handle_admin_stats(request: Request<Body>, state: AppState) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    let params = query_params(request.uri());
+    let window = params.get("window").and_then(|value| value.parse::<u64>().ok()).unwrap_or(86_400);
+    let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
     let summary = {
+        // 统计与 Key 列表在同一个锁粒度下读取，避免两次加锁之间 Key 被撤销导致名称对不上。
         let usage = state.usage.lock().await;
-        usage.summary()
+        let keys = state.api_keys.lock().await;
+        dashboard::stats(&usage, &keys, &state.config, state.started_at, window, &base_url)
     };
     json_response(&request, &state.config, StatusCode::OK, summary)
 }
+
+/// 用量统计（旧接口，保持兼容）：等价于 `GET /v1/admin/stats`。
+async fn handle_admin_usage(request: Request<Body>, state: AppState) -> Response {
+    handle_admin_stats(request, state).await
+}
+
+/// 调用日志：`GET /v1/admin/logs?window=&keyword=&key_id=&endpoint=&status=&limit=&offset=`。
+async fn handle_admin_logs(request: Request<Body>, state: AppState) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    let query = dashboard::LogQuery::from_params(&query_params(request.uri()));
+    let (items, total) = {
+        let usage = state.usage.lock().await;
+        dashboard::logs(&usage, &query)
+    };
+    json_response(
+        &request,
+        &state.config,
+        StatusCode::OK,
+        json!({
+            "object": "list",
+            "data": items,
+            "total": total,
+            "limit": query.limit,
+            "offset": query.offset,
+            "window_seconds": query.window_seconds,
+        }),
+    )
+}
+
+/// 模型目录：`GET /v1/admin/models`。除 id 外带上上游协议类型，便于看板与客户端配置对照。
+async fn handle_admin_models(request: Request<Body>, state: AppState) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    let catalog = configured_model_catalog(&state.config).await;
+    json_response(&request, &state.config, StatusCode::OK, dashboard::models(&catalog))
+}
+
 async fn listener(state: AppState, request: Request<Body>) -> Response {
     let remote = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0).unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
     let path = request.uri().path().trim_end_matches('/').to_string(); let path = if path.is_empty() { "/".to_string() } else { path };
@@ -980,7 +1278,12 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     if request.method() == axum::http::Method::OPTIONS { let mut response = StatusCode::NO_CONTENT.into_response(); response.headers_mut().extend(cors_headers(&request, &state.config)); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS")); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Authorization, Content-Type")); response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400")); return response; }
     if request.method() == axum::http::Method::GET && (path == "/" || path == "/v1") { return json_response(&request, &state.config, StatusCode::OK, json!({"object": "gateway", "name": "monkeycode-direct-gateway", "status": "ok", "endpoints": ["/health", "/v1/models", "/v1/responses", "/v1/chat/completions", "/v1/admin/clients"]})); }
     if request.method() == axum::http::Method::GET && (path == "/health" || path == "/v1/health") { return json_response(&request, &state.config, StatusCode::OK, json!({"ok": true, "mode": "direct-signed-gateway", "auth_required": state.config.auth_required, "tls": state.config.tls_cert.is_some()})); }
-    if request.method() == axum::http::Method::GET && path == "/admin" { return admin_page(); }
+    if request.method() == axum::http::Method::GET && path == "/admin" { return dashboard::page(); }
+    if request.method() == axum::http::Method::GET && (path == "/dashboard" || path == "/ui") { return dashboard::page(); }
+    if request.method() == axum::http::Method::GET && (path == "/favicon.ico" || path == "/favicon.svg") { return favicon(); }
+    if path == "/v1/admin/stats" && request.method() == axum::http::Method::GET { return handle_admin_stats(request, state).await; }
+    if path == "/v1/admin/models" && request.method() == axum::http::Method::GET { return handle_admin_models(request, state).await; }
+    if path == "/v1/admin/logs" && request.method() == axum::http::Method::GET { return handle_admin_logs(request, state).await; }
     if path == "/v1/admin/usage" && request.method() == axum::http::Method::GET { return handle_admin_usage(request, state).await; }
     if (path == "/v1/admin/clients" || path == "/v1/admin/clients/sync") && matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::POST) { return handle_admin_clients(request, state).await; }
     if path == "/v1/admin/keys" {
@@ -992,6 +1295,7 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
             if request.method() == axum::http::Method::POST { return handle_admin_keys(request, state, Some(id), "rotate").await; }
         }
         if request.method() == axum::http::Method::DELETE { return handle_admin_keys(request, state, Some(key_id), "revoke").await; }
+        if request.method() == axum::http::Method::PATCH { return handle_admin_keys(request, state, Some(key_id), "edit").await; }
     }
     let token = bearer_token(&request).map(str::to_owned);
     let Some(key_id) = authenticated_key_id(token, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
@@ -1011,7 +1315,7 @@ async fn main() -> Result<(), BoxError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("") {
         "serve" => return run_server(&args[1..]).await,
-        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "help" | "-h" | "--help" => return cli::run(&args).await,
+        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "dashboard" | "web" | "help" | "-h" | "--help" => return cli::run(&args).await,
         "" => return cli::run(&[]).await,
         _ => {}
     }
@@ -1040,6 +1344,8 @@ async fn ensure_named_key(state: &AppState, name: &str, preferred: Option<String
                 key_hash: hash_key(&raw),
                 created_at: now(),
                 revoked: false,
+                // 托管 Key 由客户端同步流程自动创建，备注标记来源方便在看板中区分。
+                note: "client-managed".into(),
             };
             let issued = clients::IssuedKey { id: record.id.clone(), raw };
             store.keys.push(record);
@@ -1052,6 +1358,7 @@ async fn ensure_named_key(state: &AppState, name: &str, preferred: Option<String
                 key_hash: hash_key(&raw),
                 created_at: now(),
                 revoked: false,
+                note: "client-managed".into(),
             };
             let issued = clients::IssuedKey { id: record.id.clone(), raw };
             store.keys.push(record);
@@ -1147,7 +1454,8 @@ async fn run_server(args: &[String]) -> Result<(), BoxError> {
     }
     let api_keys = ApiKeyStore::load(config.api_keys_path.clone()).await?;
     let usage = UsageStore::load(config.usage_path.clone(), config.max_usage_records).await?;
-    let state = AppState { config: config.clone(), client, admin_key: Arc::new(admin_key), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)) };
+    let started_at = now();
+    let state = AppState { config: config.clone(), client, admin_key: Arc::new(admin_key), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)), started_at };
     if config.manage_clients {
         tokio::spawn(client_sync_loop(state.clone()));
     }
