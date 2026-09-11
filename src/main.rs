@@ -899,7 +899,24 @@ fn normalize_responses_request(body: &Value, model: &str, prompt: &str) -> Value
     outgoing.insert("input".into(), input);
     outgoing.insert("store".into(), body.get("store").cloned().unwrap_or(json!(false)));
     outgoing.remove("messages"); outgoing.remove("system");
+    strip_disabled_reasoning(&mut outgoing);
     Value::Object(outgoing)
+}
+
+/// Pi 在关闭思考时会带 `reasoning.effort = none`。不少上游模型（如 Qwen）拒绝这个取值，
+/// 直接 502。effort 为 none/off 时改为不传 reasoning，让上游走默认非思考路径。
+fn strip_disabled_reasoning(outgoing: &mut Map<String, Value>) {
+    let effort = outgoing
+        .get("reasoning")
+        .and_then(|value| value.get("effort"))
+        .or_else(|| outgoing.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(effort.as_str(), "none" | "off" | "false" | "0") {
+        outgoing.remove("reasoning");
+        outgoing.remove("reasoning_effort");
+    }
 }
 
 async fn json_file(path: &Path, label: &str) -> Result<Value, GatewayError> {
@@ -1515,6 +1532,19 @@ mod tests {
         assert_eq!(outgoing["input"][0]["role"], "developer");
         assert_eq!(outgoing["input"][2]["role"], "assistant");
         assert_eq!(outgoing["input"][2]["content"], json!([{"type": "output_text", "text": "hello"}]));
+    }
+
+    #[test]
+    fn responses_drop_reasoning_effort_none() {
+        let body = json!({
+            "model": "monkeycode-basic/qwen3.8-flash",
+            "input": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "none"},
+            "reasoning_effort": "none"
+        });
+        let outgoing = normalize_responses_request(&body, "monkeycode-basic/qwen3.8-flash", "You are a helpful assistant.");
+        assert!(outgoing.get("reasoning").is_none());
+        assert!(outgoing.get("reasoning_effort").is_none());
     }
 
     #[test]

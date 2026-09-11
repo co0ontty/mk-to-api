@@ -209,7 +209,7 @@ print_access() {
   local admin_file=""
   admin_file="$(admin_key_file || true)"
 
-  printf '\n----------------------------------------\n'
+  printf '\n%s\n' '----------------------------------------'
   printf '服务已在后台运行（开机自启）\n'
   printf '管理界面: http://127.0.0.1:%s/admin\n' "$port"
   printf '打开方式: 用浏览器访问上面的地址\n'
@@ -228,7 +228,7 @@ print_access() {
     printf '停止服务:   launchctl bootout %s\n' "$TARGET"
   fi
   printf '日志:       %s\n' "$LOG"
-  printf '----------------------------------------\n'
+  printf '%s\n' '----------------------------------------'
 }
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mk2api-install.XXXXXX")"
