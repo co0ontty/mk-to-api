@@ -153,6 +153,20 @@ label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(
 .kv{display:grid;grid-template-columns:132px 1fr;gap:7px 14px;font-size:12.8px}
 .kv div:nth-child(odd){color:var(--muted)}
 .mono-block{font-family:var(--mono);font-size:12.2px;background:#0d1220;border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px 14px;overflow:auto;color:#c9d6ef}
+.ver{all:unset;cursor:pointer;font:inherit;letter-spacing:.4px;border-radius:6px;padding:1px 7px;margin-top:3px;display:inline-block}
+.ver.ok{color:var(--ok);background:#3ddc9718}
+.ver.warn{color:var(--warn);background:#ffb64818}
+.ver.mute{color:var(--dim);background:#ffffff0a}
+.ver:hover{filter:brightness(1.12)}
+.modal{position:fixed;inset:0;z-index:70;display:flex;align-items:center;justify-content:center;background:rgba(6,9,15,.78);backdrop-filter:blur(7px)}
+.modal-card{width:min(540px,92vw);background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:22px 22px 16px;box-shadow:0 30px 80px #0009;max-height:86vh;overflow:auto}
+.modal-card h2{margin:0 0 6px;font-size:18px}
+.rel-list{display:flex;flex-direction:column;gap:6px;margin:12px 0 16px;max-height:260px;overflow:auto}
+.rel-item{display:flex;gap:10px;align-items:center;padding:8px 10px;border:1px solid var(--line);border-radius:10px;cursor:pointer;font-size:13px}
+.rel-item:hover{background:#ffffff08}
+.rel-item.active{border-color:#4c8dff66;background:var(--accent-soft)}
+.rel-item .tag{font-family:var(--mono);font-size:12.5px;flex:1}
+.key-plain{font-family:var(--mono);font-size:12px;max-width:220px;overflow:hidden;text-overflow:ellipsis}
 
 @media (max-width:900px){
   .shell{grid-template-columns:1fr}
@@ -186,7 +200,7 @@ label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(
 
 <div class="shell hidden" id="shell">
   <aside class="side">
-    <div class="brand"><span class="dot"></span><span>mk2api<small id="sideVersion">SIGNED GATEWAY</small></span></div>
+    <div class="brand"><span class="dot"></span><span>mk2api<small><button type="button" id="sideVersion" class="ver mute" title="检查更新 / 回滚">v-</button></small></span></div>
     <nav class="nav" id="nav">
       <button data-view="overview" class="active"><i>◧</i>概览</button>
       <button data-view="usage"><i>◫</i>用量分析</button>
@@ -285,7 +299,7 @@ label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(
     <!-- ============ API Key ============ -->
     <section data-view="keys" class="hidden">
       <div class="card">
-        <div class="card-head"><div><h3>签发 API Key</h3><div class="hint">明文仅在创建/轮换时展示一次，服务端只保存 SHA-256 摘要</div></div></div>
+        <div class="card-head"><div><h3>签发 API Key</h3><div class="hint">明文保存在本机 ~/.mk2api/api-keys.json，创建后可随时查看或复制</div></div></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
           <label class="field" style="min-width:220px">名称（用于区分客户端）
             <input id="newKeyName" placeholder="例如 production-app" autocomplete="off">
@@ -300,7 +314,7 @@ label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(
       <div class="card" style="margin-top:14px">
         <div class="card-head"><div><h3>Key 列表</h3><div class="hint" id="keyCount">-</div></div><button class="btn sm" id="reloadKeys">重新加载</button></div>
         <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr>
-          <th>名称</th><th>备注</th><th>Key ID</th><th>创建时间</th><th>状态</th>
+          <th>名称</th><th>备注</th><th>API Key</th><th>Key ID</th><th>创建时间</th><th>状态</th>
           <th class="sortable" data-sort="requests" style="text-align:right">请求数<span class="arrow">↕</span></th>
           <th class="sortable" data-sort="tokens" style="text-align:right">Token<span class="arrow">↕</span></th>
           <th style="text-align:right">操作</th>
@@ -351,6 +365,20 @@ label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(
   </main>
 </div>
 
+<div class="modal hidden" id="updateModal">
+  <div class="modal-card">
+    <h2>版本更新</h2>
+    <p class="hint" id="updateHint" style="color:var(--muted);margin:0 0 14px">点击左上角版本号可检查更新或回滚历史版本。</p>
+    <div class="kv" id="updateKv"></div>
+    <div class="rel-list" id="releaseList"></div>
+    <div style="display:flex;gap:9px;flex-wrap:wrap;justify-content:flex-end">
+      <button class="btn" id="updateClose">关闭</button>
+      <button class="btn" id="updateRollback">回滚到所选版本</button>
+      <button class="btn primary" id="updateLatest">更新到最新</button>
+    </div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <script>
@@ -374,6 +402,9 @@ const state = {
   modelSort: { key: 'requests', dir: -1 },
   logs: { offset: 0, limit: 50, total: 0, items: [], filters: {} },
   timer: null,
+  update: null,
+  selectedTag: '',
+  revealed: {},
 };
 
 /* ---------------- 通用工具 ---------------- */
@@ -641,6 +672,11 @@ function keyName(id){
   const found = state.keys.find(key => key.id === id);
   return found ? found.name : id;
 }
+function maskKey(key){
+  if (!key) return '';
+  if (key.length <= 14) return '••••••••••••';
+  return key.slice(0, 10) + '••••' + key.slice(-4);
+}
 function sortItems(items, sort){
   return [...items].sort((a, b) => {
     const left = a[sort.key], right = b[sort.key];
@@ -678,22 +714,31 @@ function renderKeys(){
     return { ...key, requests: stat.requests || 0, tokens: stat.total_tokens || 0 };
   }), state.keySort);
   $('#keyCount').textContent = `共 ${state.keys.length} 个（有效 ${state.keys.filter(k => !k.revoked).length} 个）· 统计口径为当前时间窗`;
-  $('#keysBody').innerHTML = items.length ? items.map(key => `
+  $('#keysBody').innerHTML = items.length ? items.map(key => {
+    const secret = key.key || '';
+    const shown = state.revealed[key.id];
+    const display = secret ? (shown ? secret : maskKey(secret)) : '旧版未保存明文';
+    return `
     <tr>
       <td>${esc(key.name)}</td>
       <td><span class="truncate" title="${esc(key.note || '')}">${esc(key.note || '-')}</span></td>
-      <td class="mono"><span class="truncate" title="${esc(key.id)}">${esc(key.id.slice(0, 22))}…</span></td>
+      <td><span class="key-plain" title="${secret ? '点击查看或复制' : '创建于旧版本，轮换后可查看'}">${esc(display)}</span></td>
+      <td class="mono"><span class="truncate" title="${esc(key.id)}">${esc(key.id.slice(0, 18))}…</span></td>
       <td class="mono">${timeOf(key.created_at)}</td>
       <td>${key.revoked ? '<span class="pill bad">已撤销</span>' : '<span class="pill ok">有效</span>'}</td>
       <td class="num">${num(key.requests)}</td>
       <td class="num">${num(key.tokens)}</td>
-      <td style="text-align:right">${key.revoked ? '<span class="pill mute">不可操作</span>' : `
+      <td style="text-align:right">
         <span class="row-actions">
-          <button class="btn sm" data-rename="${esc(key.id)}">改名</button>
+          ${secret ? `<button class="btn sm" data-reveal="${esc(key.id)}">${shown ? '隐藏' : '查看'}</button>
+          <button class="btn sm" data-copy="${esc(key.id)}">复制</button>` : '<span class="pill mute">请轮换</span>'}
+          ${key.revoked ? '' : `<button class="btn sm" data-rename="${esc(key.id)}">改名</button>
           <button class="btn sm" data-rotate="${esc(key.id)}">轮换</button>
-          <button class="btn sm danger" data-revoke="${esc(key.id)}">撤销</button>
-        </span>`}</td>
-    </tr>`).join('') : '<tr><td colspan="8"><div class="empty">还没有 API Key，先在上方创建一个</div></td></tr>';
+          <button class="btn sm danger" data-revoke="${esc(key.id)}">撤销</button>`}
+        </span>
+      </td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="9"><div class="empty">还没有 API Key，先在上方创建一个</div></td></tr>';
   $$('[data-sort]').forEach(th => {
     if (!th.closest('[data-view="keys"]')) return;
     const active = th.dataset.sort === state.keySort.key;
@@ -761,7 +806,7 @@ function renderSystem(){
   const s = state.stats;
   const info = s?.system || {};
   $('#sideBase').textContent = info.base_url || '';
-  $('#sideVersion').textContent = (info.version || 'mk2api') + ' · ' + (info.mode || 'gateway');
+  renderVersionBadge();
   $('#systemKv').innerHTML = [
     ['服务版本', esc(info.version || '-')],
     ['运行模式', esc(info.mode || '-')],
@@ -847,10 +892,71 @@ async function loadLogs(){
   state.logs.total = data.total || 0;
   renderLogs();
 }
+async function loadUpdate(){
+  try { state.update = await api('/v1/admin/update'); }
+  catch { state.update = null; }
+  renderVersionBadge();
+}
+function renderVersionBadge(){
+  const button = $('#sideVersion');
+  const current = state.update?.current || (state.stats?.system?.version ? 'v' + state.stats.system.version : 'v-');
+  button.textContent = current;
+  button.classList.remove('ok', 'warn', 'mute');
+  if (!state.update || state.update.error) button.classList.add('mute');
+  else if (state.update.update_available) button.classList.add('warn');
+  else button.classList.add('ok');
+  button.title = state.update?.update_available ? ('有新版本 ' + state.update.latest + '，点击更新或回滚') : '已是最新版本，点击可回滚历史版本';
+}
+function openUpdateModal(){
+  const data = state.update || {};
+  $('#updateHint').textContent = data.error ? ('无法读取 GitHub Release：' + data.error) : '黄色表示有新版本，绿色表示已是最新。选择历史版本可回滚。';
+  $('#updateKv').innerHTML = [
+    ['当前版本', `<span class="mono">${esc(data.current || '-')}</span>`],
+    ['最新版本', `<span class="mono">${esc(data.latest || '-')}</span>`],
+    ['状态', data.update_available ? '<span class="pill warn">可更新</span>' : data.error ? '<span class="pill mute">未知</span>' : '<span class="pill ok">已是最新</span>'],
+  ].map(([k, v]) => `<div>${k}</div><div>${v}</div>`).join('');
+  const releases = data.releases || [];
+  if (!state.selectedTag) state.selectedTag = data.current || '';
+  $('#releaseList').innerHTML = releases.length ? releases.map(item => `
+    <label class="rel-item ${item.tag === state.selectedTag ? 'active' : ''}">
+      <input type="radio" name="releaseTag" value="${esc(item.tag)}" ${item.tag === state.selectedTag ? 'checked' : ''}>
+      <span class="tag">${esc(item.tag)}</span>
+      ${item.current ? '<span class="pill ok">当前</span>' : ''}
+      ${item.prerelease ? '<span class="pill warn">预发布</span>' : ''}
+    </label>`).join('') : '<div class="empty">没有读取到历史版本</div>';
+  $('#updateLatest').disabled = !data.latest || data.current === data.latest;
+  $('#updateModal').classList.remove('hidden');
+}
+function closeUpdateModal(){ $('#updateModal').classList.add('hidden'); }
+async function applyVersion(tag){
+  if (!tag) return toast('请选择一个版本', 'warn');
+  const label = tag === 'latest' ? '最新版本' : tag;
+  if (!confirm('将安装 ' + label + ' 并重启本机服务，确认继续？')) return;
+  try {
+    toast('正在下载 ' + label + ' ...');
+    const result = await api('/v1/admin/update', { method: 'POST', body: JSON.stringify({ tag }) });
+    if (result.unchanged) { toast('已经是 ' + result.version); return; }
+    toast('已安装 ' + result.version + '，正在重启...');
+    closeUpdateModal();
+    for (let i = 0; i < 25; i++){
+      await new Promise(resolve => setTimeout(resolve, 800));
+      try {
+        const health = await fetch('/health', { cache: 'no-store' });
+        if (health.ok) {
+          await loadUpdate();
+          await refreshAll(true);
+          toast('已切换到 ' + (state.update?.current || result.version));
+          return;
+        }
+      } catch {}
+    }
+    toast('服务正在重启，请稍后刷新页面', 'warn');
+  } catch (error) { toast(error.message, 'bad'); }
+}
 async function refreshAll(silent){
   try {
     await loadStats();
-    await Promise.all([loadKeys(), loadModels()]);
+    await Promise.all([loadKeys(), loadModels(), loadUpdate()]);
     renderAll();
     if (!silent) toast('已刷新 · ' + new Date().toLocaleTimeString());
   } catch (error) {
@@ -946,7 +1052,21 @@ function bind(){
     const rotate = event.target.closest('[data-rotate]');
     const revoke = event.target.closest('[data-revoke]');
     const rename = event.target.closest('[data-rename]');
+    const reveal = event.target.closest('[data-reveal]');
+    const copy = event.target.closest('[data-copy]');
     try {
+      if (reveal) {
+        state.revealed[reveal.dataset.reveal] = !state.revealed[reveal.dataset.reveal];
+        renderKeys();
+        return;
+      }
+      if (copy) {
+        const target = state.keys.find(key => key.id === copy.dataset.copy);
+        if (!target?.key) return toast('该 Key 没有保存明文，请先轮换', 'warn');
+        try { await navigator.clipboard.writeText(target.key); toast('已复制 API Key'); }
+        catch { toast('复制失败，请改用查看后手动选择', 'warn'); }
+        return;
+      }
       if (rotate) {
         if (!confirm('轮换后旧 Key 立即失效，确认继续？')) return;
         const data = await api('/v1/admin/keys/' + encodeURIComponent(rotate.dataset.rotate) + '/rotate', { method: 'POST' });
@@ -1004,6 +1124,20 @@ function bind(){
     try { state.clients = await api('/v1/admin/clients/sync', { method: 'POST' }); renderSystem(); toast('客户端配置已同步'); }
     catch (error) { toast(error.message, 'bad'); }
   });
+  $('#sideVersion').addEventListener('click', async () => {
+    await loadUpdate();
+    openUpdateModal();
+  });
+  $('#updateClose').addEventListener('click', closeUpdateModal);
+  $('#updateModal').addEventListener('click', event => { if (event.target === $('#updateModal')) closeUpdateModal(); });
+  $('#releaseList').addEventListener('change', event => {
+    const input = event.target.closest('input[name="releaseTag"]');
+    if (!input) return;
+    state.selectedTag = input.value;
+    openUpdateModal();
+  });
+  $('#updateLatest').addEventListener('click', () => applyVersion('latest'));
+  $('#updateRollback').addEventListener('click', () => applyVersion(state.selectedTag));
   window.addEventListener('resize', () => { if (state.view === 'overview' || state.view === 'usage') renderTrend(state.stats?.series || []); });
   document.addEventListener('keydown', event => {
     if (event.key === 'r' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); refreshAll(); }

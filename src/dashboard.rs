@@ -304,6 +304,7 @@ mod tests {
             id: "key_a".into(),
             name: "pi".into(),
             key_hash: "hash".into(),
+            secret: Some("mk_live_test".into()),
             created_at: now_ts - 100,
             revoked: false,
             note: "本地测试".into(),

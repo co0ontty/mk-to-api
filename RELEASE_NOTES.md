@@ -1,6 +1,6 @@
-# v0.1.21 — 安装收尾报错与 Qwen reasoning none
+# v0.1.22 — 管理台更新与 API Key 查看
 
-修复 macOS 一键安装在打印分隔线时 `printf: --: invalid option`，以及 Pi 关闭思考时 Qwen 返回 502。
+管理台左上角版本号可点击：绿色为最新，黄色表示有新版本。支持更新到最新或回滚历史版本。API Key 创建后可随时查看、复制。
 
 ## 安装
 
@@ -8,13 +8,4 @@
 bash -c "$(curl -fsSL 'https://raw.githubusercontent.com/co0ontty/mk-to-api/main/online/install')"
 ```
 
-安装完成后服务在后台运行。用浏览器打开：
-
-```text
-http://127.0.0.1:8123/admin
-```
-
-## 这个版本
-
-- 安装脚本不再把 `---` 当成 printf 选项，安装结束不会报错
-- Pi 传入 `reasoning.effort = none` 时不再转发给上游，避免 Qwen 502
+管理界面：http://127.0.0.1:8123/admin

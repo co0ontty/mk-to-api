@@ -28,6 +28,7 @@ mod anthropic;
 mod cli;
 mod clients;
 mod dashboard;
+mod update;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -76,6 +77,8 @@ struct ApiKeyRecord {
     id: String,
     name: String,
     key_hash: String,
+    /// 明文 Key，供管理台查看。旧记录可能为空。
+    secret: Option<String>,
     created_at: u64,
     revoked: bool,
     note: String,
@@ -312,13 +315,14 @@ async fn load_admin_key(config: &Config) -> Result<(String, bool), BoxError> {
 
 impl ApiKeyStore {
     async fn load(path: PathBuf) -> Result<Self, BoxError> {
-        let keys = match tokio::fs::read_to_string(&path).await {
+        let mut keys = match tokio::fs::read_to_string(&path).await {
             Ok(text) => {
                 let value: Value = serde_json::from_str(&text)?;
                 value.get("keys").and_then(Value::as_array).into_iter().flatten().filter_map(|item| Some(ApiKeyRecord {
                     id: item.get("id")?.as_str()?.to_string(),
                     name: item.get("name").and_then(Value::as_str).unwrap_or("Unnamed key").to_string(),
                     key_hash: item.get("key_hash")?.as_str()?.to_string(),
+                    secret: item.get("key").or_else(|| item.get("secret")).and_then(Value::as_str).filter(|value| !value.is_empty()).map(str::to_string),
                     created_at: item.get("created_at").and_then(Value::as_u64).unwrap_or(0),
                     revoked: item.get("revoked").and_then(Value::as_bool).unwrap_or(false),
                     note: item.get("note").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -327,19 +331,41 @@ impl ApiKeyStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(boxed(format!("cannot read API keys: {} ({e})", path.display()))),
         };
+        if let Some(parent) = path.parent() {
+            if let Ok(text) = std::fs::read_to_string(parent.join("clients.json")) {
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    for name in ["pi", "codex"] {
+                        let id = value.pointer(&format!("/{name}/key_id")).and_then(Value::as_str);
+                        let secret = value.pointer(&format!("/{name}/key")).and_then(Value::as_str);
+                        if let (Some(id), Some(secret)) = (id, secret) {
+                            if let Some(key) = keys.iter_mut().find(|item| item.id == id && item.secret.is_none()) {
+                                key.secret = Some(secret.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(Self { path, keys })
     }
 
     fn serialized(&self) -> Result<String, BoxError> {
         let value = json!({"keys": self.keys.iter().map(|key| json!({
             "id": key.id, "name": key.name, "key_hash": key.key_hash,
-            "created_at": key.created_at, "revoked": key.revoked, "note": key.note,
+            "key": key.secret, "created_at": key.created_at, "revoked": key.revoked, "note": key.note,
         })).collect::<Vec<_>>()});
         Ok(serde_json::to_string_pretty(&value)?)
     }
 
     fn public_key(key: &ApiKeyRecord) -> Value {
-        json!({"id": key.id, "name": key.name, "created_at": key.created_at, "revoked": key.revoked, "note": key.note})
+        json!({
+            "id": key.id,
+            "name": key.name,
+            "created_at": key.created_at,
+            "revoked": key.revoked,
+            "note": key.note,
+            "key": key.secret,
+        })
     }
 }
 
@@ -698,6 +724,15 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
         };
         return json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": keys}));
     }
+    if action == "get" {
+        let Some(key_id) = key_id else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
+        let public = {
+            let store = state.api_keys.lock().await;
+            store.keys.iter().find(|key| key.id == key_id).map(ApiKeyStore::public_key)
+        };
+        let Some(public) = public else { return GatewayError::new(StatusCode::NOT_FOUND, "API key not found").into_response(); };
+        return json_response(&request, &state.config, StatusCode::OK, json!({"data": public}));
+    }
     if action == "create" {
         let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => return e.into_response() };
         let name = body.get("name").and_then(Value::as_str).unwrap_or("Unnamed key").trim();
@@ -705,7 +740,7 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
         // note 为可选备注字段，看板用它标记 Key 用途（如「给同事 A」）。
         let note = body.get("note").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let raw_key = new_api_key();
-        let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name: name.to_string(), key_hash: hash_key(&raw_key), created_at: now(), revoked: false, note };
+        let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name: name.to_string(), key_hash: hash_key(&raw_key), secret: Some(raw_key.clone()), created_at: now(), revoked: false, note };
         let public = ApiKeyStore::public_key(&record);
         let save_snapshot = {
             let mut store = state.api_keys.lock().await;
@@ -725,7 +760,7 @@ async fn handle_admin_keys(request: Request<Body>, state: AppState, key_id: Opti
             let note = store.keys[index].note.clone();
             store.keys[index].revoked = true;
             let raw_key = new_api_key();
-            let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name, key_hash: hash_key(&raw_key), created_at: now(), revoked: false, note };
+            let record = ApiKeyRecord { id: format!("key_{}", Uuid::new_v4().simple()), name, key_hash: hash_key(&raw_key), secret: Some(raw_key.clone()), created_at: now(), revoked: false, note };
             let public = ApiKeyStore::public_key(&record);
             store.keys.push(record);
             let snapshot = store.serialized().map(|contents| (store.path.clone(), contents));
@@ -1227,6 +1262,26 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     }
 }
 
+/// 版本检查 / 更新：`GET /v1/admin/update` 查看，`POST /v1/admin/update {"tag":"latest"|"v0.1.20"}` 安装。
+async fn handle_admin_update(request: Request<Body>, state: AppState, apply: bool) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    if !apply {
+        let payload = update::status(&state.client).await;
+        return json_response(&request, &state.config, StatusCode::OK, payload);
+    }
+    let body = match read_json(request, state.config.max_body_bytes).await {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let tag = body.get("tag").and_then(Value::as_str).unwrap_or("latest");
+    match update::apply(&state.client, tag).await {
+        Ok(value) => json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, value),
+        Err(error) => GatewayError::new(StatusCode::BAD_GATEWAY, format!("{error}")).with_type("api_error").into_response(),
+    }
+}
+
 /// 看板主统计：`GET /v1/admin/stats?window=<秒>`。
 ///
 /// `window=0` 表示全部时间；旧的无参数形式等价于 24 小时。
@@ -1298,6 +1353,10 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     if request.method() == axum::http::Method::GET && path == "/admin" { return dashboard::page(); }
     if request.method() == axum::http::Method::GET && (path == "/dashboard" || path == "/ui") { return dashboard::page(); }
     if request.method() == axum::http::Method::GET && (path == "/favicon.ico" || path == "/favicon.svg") { return favicon(); }
+    if path == "/v1/admin/update" {
+        if request.method() == axum::http::Method::GET { return handle_admin_update(request, state, false).await; }
+        if request.method() == axum::http::Method::POST { return handle_admin_update(request, state, true).await; }
+    }
     if path == "/v1/admin/stats" && request.method() == axum::http::Method::GET { return handle_admin_stats(request, state).await; }
     if path == "/v1/admin/models" && request.method() == axum::http::Method::GET { return handle_admin_models(request, state).await; }
     if path == "/v1/admin/logs" && request.method() == axum::http::Method::GET { return handle_admin_logs(request, state).await; }
@@ -1311,6 +1370,7 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
         if let Some(id) = key_id.strip_suffix("/rotate") {
             if request.method() == axum::http::Method::POST { return handle_admin_keys(request, state, Some(id), "rotate").await; }
         }
+        if request.method() == axum::http::Method::GET { return handle_admin_keys(request, state, Some(key_id), "get").await; }
         if request.method() == axum::http::Method::DELETE { return handle_admin_keys(request, state, Some(key_id), "revoke").await; }
         if request.method() == axum::http::Method::PATCH { return handle_admin_keys(request, state, Some(key_id), "edit").await; }
     }
@@ -1352,27 +1412,36 @@ async fn ensure_named_key(state: &AppState, name: &str, preferred: Option<String
     let (issued, snapshot) = {
         let mut store = state.api_keys.lock().await;
         if let Some(raw) = preferred_raw.clone() {
-            if let Some(existing) = store.keys.iter().find(|key| !key.revoked && key.key_hash == hash_key(&raw)) {
-                return Ok(clients::IssuedKey { id: existing.id.clone(), raw });
+            if let Some(existing) = store.keys.iter_mut().find(|key| !key.revoked && key.key_hash == hash_key(&raw)) {
+                let issued = clients::IssuedKey { id: existing.id.clone(), raw: raw.clone() };
+                let snapshot = if existing.secret.as_ref().map(|value| value.is_empty()).unwrap_or(true) {
+                    existing.secret = Some(raw);
+                    Some(store.serialized().map(|contents| (store.path.clone(), contents))?)
+                } else {
+                    None
+                };
+                (issued, snapshot)
+            } else {
+                let record = ApiKeyRecord {
+                    id: format!("key_{}", Uuid::new_v4().simple()),
+                    name: name.to_string(),
+                    key_hash: hash_key(&raw),
+                    secret: Some(raw.clone()),
+                    created_at: now(),
+                    revoked: false,
+                    note: "client-managed".into(),
+                };
+                let issued = clients::IssuedKey { id: record.id.clone(), raw };
+                store.keys.push(record);
+                (issued, Some(store.serialized().map(|contents| (store.path.clone(), contents))?))
             }
-            let record = ApiKeyRecord {
-                id: format!("key_{}", Uuid::new_v4().simple()),
-                name: name.to_string(),
-                key_hash: hash_key(&raw),
-                created_at: now(),
-                revoked: false,
-                // 托管 Key 由客户端同步流程自动创建，备注标记来源方便在看板中区分。
-                note: "client-managed".into(),
-            };
-            let issued = clients::IssuedKey { id: record.id.clone(), raw };
-            store.keys.push(record);
-            (issued, Some(store.serialized().map(|contents| (store.path.clone(), contents))?))
         } else {
             let raw = new_api_key();
             let record = ApiKeyRecord {
                 id: format!("key_{}", Uuid::new_v4().simple()),
                 name: name.to_string(),
                 key_hash: hash_key(&raw),
+                secret: Some(raw.clone()),
                 created_at: now(),
                 revoked: false,
                 note: "client-managed".into(),
