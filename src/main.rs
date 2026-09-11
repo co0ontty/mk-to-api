@@ -640,10 +640,40 @@ fn error_response(request: &Request<Body>, state: &Config, error: GatewayError) 
     json_response(request, state, error.status, json!({"error": {"message": error.message, "type": error.error_type, "param": error.param, "code": error.code}}))
 }
 
+/// 从 `Authorization` 头解析调用凭证。
+///
+/// 兼容两种写法：`Authorization: Bearer <token>` 与 `Authorization: <token>`。
+/// 部分 OpenAI 兼容客户端（One API、Cherry Studio 等）会跳过 `Bearer` 前缀直接塞原始
+/// Key，之前只认前一种，导致这些客户端一律 401。
 fn bearer_token(request: &Request<Body>) -> Option<&str> {
-    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, token) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    if value.is_empty() { return None; }
+    match value.split_once(' ') {
+        Some((scheme, token)) if scheme.eq_ignore_ascii_case("Bearer") => {
+            let token = token.trim();
+            (!token.is_empty()).then_some(token)
+        }
+        // `Basic xxx` 之类的非 Bearer 方案直接忽略；没有空格的裸 Key 视为 token。
+        Some(_) => None,
+        None => Some(value),
+    }
+}
+
+/// 统一的调用凭证提取：依次尝试 `Authorization`、`x-api-key`、`x-goog-api-key`。
+///
+/// Anthropic 生态（Claude Code、cc-switch 的 anthropic-messages 格式、Cherry Studio 等）
+/// 习惯用 `x-api-key`，Google 生态用 `x-goog-api-key`，OpenAI 生态用
+/// `Authorization: Bearer`。网关此前只读 `Authorization`，所以用 `x-api-key` 的客户端
+/// 拉取 `/v1/models` 或转发请求时都会拿到 401（「获取模型列表失败」的直接原因）。
+fn request_api_key(request: &Request<Body>) -> Option<&str> {
+    if let Some(token) = bearer_token(request) { return Some(token); }
+    for name in ["x-api-key", "x-goog-api-key"] {
+        if let Some(token) = request.headers().get(name).and_then(|value| value.to_str().ok()) {
+            let token = token.trim();
+            if !token.is_empty() { return Some(token); }
+        }
+    }
+    None
 }
 
 fn safe_equal(left: Option<&str>, right: &str) -> bool {
@@ -1178,14 +1208,33 @@ async fn stream_responses(upstream: reqwest::Response, tx: mpsc::Sender<Result<B
     let Ok(data) = upstream.json::<Value>().await else { return; };
     let mut sequence = 0u64;
     let mut event = |event_type: &str, extra: Value| { let mut map = extra.as_object().cloned().unwrap_or_default(); map.insert("type".into(), Value::String(event_type.into())); map.insert("sequence_number".into(), json!(sequence)); sequence += 1; Value::Object(map) };
-    let mut response_body = data.as_object().cloned().unwrap_or_default();
-    response_body.insert("status".into(), Value::String("in_progress".into()));
-    response_body.insert("output".into(), Value::Array(Vec::new()));
-    let created = event("response.created", json!({"response": response_body}));
-    let _ = send_sse(&tx, None, &created.to_string()).await;
-    let text = response_output_text(&data); if !text.is_empty() { let _ = send_sse(&tx, None, &event("response.output_text.delta", json!({"output_index": 0, "content_index": 0, "delta": text})).to_string()).await; }
+    let mut in_progress = data.clone();
+    if let Some(object) = in_progress.as_object_mut() {
+        object.insert("status".into(), Value::String("in_progress".into()));
+        object.insert("output".into(), Value::Array(Vec::new()));
+    }
+    let _ = send_sse(&tx, None, &event("response.created", json!({"response": in_progress})).to_string()).await;
+    if let Some(Value::Array(items)) = data.get("output") {
+        for (index, item) in items.iter().enumerate() {
+            let _ = send_sse(&tx, None, &event("response.output_item.added", json!({"output_index": index, "item": item})).to_string()).await;
+            if item.get("type").and_then(Value::as_str) == Some("message") {
+                if let Some(text) = item.pointer("/content/0/text").and_then(Value::as_str) {
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                    let _ = send_sse(&tx, None, &event("response.output_text.delta", json!({"item_id": item_id, "output_index": index, "content_index": 0, "delta": text})).to_string()).await;
+                    let _ = send_sse(&tx, None, &event("response.output_text.done", json!({"item_id": item_id, "output_index": index, "content_index": 0, "text": text})).to_string()).await;
+                }
+            }
+            let _ = send_sse(&tx, None, &event("response.output_item.done", json!({"output_index": index, "item": item})).to_string()).await;
+        }
+    } else {
+        let text = response_output_text(&data);
+        if !text.is_empty() {
+            let _ = send_sse(&tx, None, &event("response.output_text.delta", json!({"output_index": 0, "content_index": 0, "delta": text})).to_string()).await;
+        }
+    }
     let usage = data.get("usage").cloned();
-    let _ = send_sse(&tx, None, &event("response.completed", json!({"response": data})).to_string()).await;
+    let event_type = if data.get("status").and_then(Value::as_str) == Some("incomplete") { "response.incomplete" } else { "response.completed" };
+    let _ = send_sse(&tx, None, &event(event_type, json!({"response": data})).to_string()).await;
     record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, usage.as_ref()).await;
 }
 
@@ -1209,7 +1258,8 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
             let model = requested_model.clone();
             tokio::spawn(async move {
                 if let Some(completed) = anthropic::stream_as_chat(upstream, tx, model.clone()).await {
-                    record_usage(&state, &key_id, &model, "chat.completions", StatusCode::OK, started, completed.get("usage")).await;
+                    let status = if completed.get("status").and_then(Value::as_str) == Some("failed") { StatusCode::BAD_GATEWAY } else { StatusCode::OK };
+                    record_usage(&state, &key_id, &model, "chat.completions", status, started, completed.get("usage")).await;
                 }
             });
         } else {
@@ -1246,7 +1296,8 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
             let model = requested_model.clone();
             tokio::spawn(async move {
                 if let Some(completed) = anthropic::stream_as_responses(upstream, tx, model.clone()).await {
-                    record_usage(&state, &key_id, &model, "responses", StatusCode::OK, started, completed.get("usage")).await;
+                    let status = if completed.get("status").and_then(Value::as_str) == Some("failed") { StatusCode::BAD_GATEWAY } else { StatusCode::OK };
+                    record_usage(&state, &key_id, &model, "responses", status, started, completed.get("usage")).await;
                 }
             });
         } else {
@@ -1380,7 +1431,18 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     if let Some(origin) = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !origin_allowed(&state.config, origin) { return error_response(&request, &state.config, GatewayError::new(StatusCode::FORBIDDEN, "request origin is not allowed").with_type("permission_error").with_code("origin_not_allowed")); }
     }
-    if request.method() == axum::http::Method::OPTIONS { let mut response = StatusCode::NO_CONTENT.into_response(); response.headers_mut().extend(cors_headers(&request, &state.config)); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS")); response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Authorization, Content-Type")); response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400")); return response; }
+    if request.method() == axum::http::Method::OPTIONS {
+        // 放行头需要覆盖各家客户端实际会发的鉴权头（x-api-key / anthropic-version 等），
+        // 否则浏览器端工具（cc-switch web、Cherry Studio 等）的预检会失败。
+        let requested = request.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
+        let allow_headers = if requested.trim().is_empty() { HeaderValue::from_static("Authorization, Content-Type, x-api-key, x-goog-api-key, anthropic-version") } else { HeaderValue::from_str(&requested).unwrap_or_else(|_| HeaderValue::from_static("Authorization, Content-Type, x-api-key, x-goog-api-key, anthropic-version")) };
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().extend(cors_headers(&request, &state.config));
+        response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+        response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
+        response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+        return response;
+    }
     if request.method() == axum::http::Method::GET && (path == "/" || path == "/v1") { return json_response(&request, &state.config, StatusCode::OK, json!({"object": "gateway", "name": "monkeycode-direct-gateway", "status": "ok", "endpoints": ["/health", "/v1/models", "/v1/responses", "/v1/chat/completions", "/v1/admin/clients"]})); }
     if request.method() == axum::http::Method::GET && (path == "/health" || path == "/v1/health") { return json_response(&request, &state.config, StatusCode::OK, json!({"ok": true, "mode": "direct-signed-gateway", "auth_required": state.config.auth_required, "tls": state.config.tls_cert.is_some()})); }
     if request.method() == axum::http::Method::GET && path == "/admin" { return dashboard::page(); }
@@ -1410,7 +1472,7 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
         if request.method() == axum::http::Method::DELETE { return handle_admin_keys(request, state, Some(key_id), "revoke").await; }
         if request.method() == axum::http::Method::PATCH { return handle_admin_keys(request, state, Some(key_id), "edit").await; }
     }
-    let token = bearer_token(&request).map(str::to_owned);
+    let token = request_api_key(&request).map(str::to_owned);
     let Some(key_id) = authenticated_key_id(token, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
     if request.method() == axum::http::Method::GET && (path == "/models" || path == "/v1/models") {
         return match configured_model_ids(&state.config).await {
@@ -1667,6 +1729,44 @@ mod tests {
         ];
         let found = resolve_model(&models, "qwen3.8-flash").unwrap();
         assert_eq!(found["model"], "monkeycode-basic/qwen3.8-flash");
+    }
+
+    fn request_with_headers(headers: &[(&str, &str)]) -> Request<Body> {
+        let mut request = Request::builder().uri("/v1/models").body(Body::empty()).unwrap();
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        request
+    }
+
+    #[test]
+    fn request_api_key_accepts_bearer_and_raw_authorization() {
+        let bearer = request_with_headers(&[("authorization", "Bearer mk_live_abc")]);
+        assert_eq!(request_api_key(&bearer), Some("mk_live_abc"));
+        let lower = request_with_headers(&[("authorization", "bearer mk_live_abc")]);
+        assert_eq!(request_api_key(&lower), Some("mk_live_abc"));
+        // One API / Cherry Studio 等会发不带 scheme 的裸 Key。
+        let raw = request_with_headers(&[("authorization", "mk_live_abc")]);
+        assert_eq!(request_api_key(&raw), Some("mk_live_abc"));
+        // Basic 之类的方案不应被当成 Key。
+        let basic = request_with_headers(&[("authorization", "Basic abc123")]);
+        assert_eq!(request_api_key(&basic), None);
+    }
+
+    #[test]
+    fn request_api_key_accepts_x_api_key_and_google_key() {
+        // cc-switch 用 anthropic-messages 格式取模型时会发 x-api-key。
+        let anthropic = request_with_headers(&[("x-api-key", "sk-anthropic")]);
+        assert_eq!(request_api_key(&anthropic), Some("sk-anthropic"));
+        let google = request_with_headers(&[("x-goog-api-key", "goog-key")]);
+        assert_eq!(request_api_key(&google), Some("goog-key"));
+        // Authorization 优先于其它头。
+        let both = request_with_headers(&[("authorization", "Bearer first"), ("x-api-key", "second")]);
+        assert_eq!(request_api_key(&both), Some("first"));
+        assert_eq!(request_api_key(&request_with_headers(&[])), None);
     }
 
     #[test]
