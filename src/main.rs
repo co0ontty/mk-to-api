@@ -66,7 +66,8 @@ struct Config {
 struct AppState {
     config: Arc<Config>,
     client: reqwest::Client,
-    admin_key: Arc<String>,
+    // 管理台密钥可在线修改，用标准库 RwLock（只在极短临界区加锁，不跨 await）。
+    admin_key: Arc<std::sync::RwLock<String>>,
     api_keys: Arc<Mutex<ApiKeyStore>>,
     usage: Arc<Mutex<UsageStore>>,
     started_at: u64,
@@ -664,7 +665,8 @@ async fn authenticated_key_id(token: Option<String>, state: &AppState) -> Option
 }
 
 fn admin_authorized(request: &Request<Body>, state: &AppState) -> bool {
-    safe_equal(bearer_token(request), state.admin_key.as_ref().as_str())
+    let expected = state.admin_key.read().map(|value| value.clone()).unwrap_or_default();
+    safe_equal(bearer_token(request), expected.as_str())
 }
 
 /// 站点图标。
@@ -1262,6 +1264,37 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     }
 }
 
+/// 修改管理台登录密钥：`POST /v1/admin/admin-key {"key":"..."}`。
+///
+/// 不传 `key` 时自动生成一个，并把明文回给调用方。
+/// 如果当前 Admin Key 来自环境变量 `DIRECT_GATEWAY_ADMIN_KEY`，则不允许改写。
+async fn handle_admin_key_change(request: Request<Body>, state: AppState) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    if state.config.admin_key.is_some() {
+        return GatewayError::new(StatusCode::CONFLICT, "Admin Key is pinned by configuration (DIRECT_GATEWAY_ADMIN_KEY); unset it to change the key here").with_type("invalid_request_error").into_response();
+    }
+    let body = match read_json(request, state.config.max_body_bytes).await {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let provided = body.get("key").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    let key = if provided.is_empty() {
+        format!("mk_admin_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+    } else {
+        if provided.len() < 12 {
+            return GatewayError::new(StatusCode::BAD_REQUEST, "Admin Key must be at least 12 characters").with_type("invalid_request_error").into_response();
+        }
+        provided.to_string()
+    };
+    if let Err(error) = write_private(&state.config.admin_key_path, &format!("{key}\n")).await {
+        return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save Admin Key: {error}")).with_type("api_error").into_response();
+    }
+    *state.admin_key.write().expect("admin key lock") = key.clone();
+    json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, json!({"ok": true, "key": key, "path": state.config.admin_key_path.display().to_string()}))
+}
+
 /// 版本检查 / 更新：`GET /v1/admin/update` 查看，`POST /v1/admin/update {"tag":"latest"|"v0.1.20"}` 安装。
 async fn handle_admin_update(request: Request<Body>, state: AppState, apply: bool) -> Response {
     if !admin_authorized(&request, &state) {
@@ -1353,6 +1386,9 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     if request.method() == axum::http::Method::GET && path == "/admin" { return dashboard::page(); }
     if request.method() == axum::http::Method::GET && (path == "/dashboard" || path == "/ui") { return dashboard::page(); }
     if request.method() == axum::http::Method::GET && (path == "/favicon.ico" || path == "/favicon.svg") { return favicon(); }
+    if path == "/v1/admin/admin-key" {
+        if request.method() == axum::http::Method::POST { return handle_admin_key_change(request, state).await; }
+    }
     if path == "/v1/admin/update" {
         if request.method() == axum::http::Method::GET { return handle_admin_update(request, state, false).await; }
         if request.method() == axum::http::Method::POST { return handle_admin_update(request, state, true).await; }
@@ -1541,7 +1577,7 @@ async fn run_server(args: &[String]) -> Result<(), BoxError> {
     let api_keys = ApiKeyStore::load(config.api_keys_path.clone()).await?;
     let usage = UsageStore::load(config.usage_path.clone(), config.max_usage_records).await?;
     let started_at = now();
-    let state = AppState { config: config.clone(), client, admin_key: Arc::new(admin_key), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)), started_at };
+    let state = AppState { config: config.clone(), client, admin_key: Arc::new(std::sync::RwLock::new(admin_key)), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)), started_at };
     if config.manage_clients {
         tokio::spawn(client_sync_loop(state.clone()));
     }

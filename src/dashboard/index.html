@@ -355,6 +355,17 @@ label.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(
       <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">
         <div class="card"><div class="card-head"><div><h3>服务状态</h3><div class="hint">本地网关运行时信息</div></div></div><div class="kv" id="systemKv"></div></div>
         <div class="card"><div class="card-head"><div><h3>客户端托管</h3><div class="hint">Pi / Codex 配置同步结果</div></div><button class="btn sm" id="syncClients">立即同步</button></div><div id="clientsBox" class="kv"></div></div>
+        <div class="card">
+          <div class="card-head"><div><h3>管理密钥</h3><div class="hint">修改后当前密钥立即失效，需用新密钥登录</div></div></div>
+          <label class="field">新的 Admin Key（留空自动生成）
+            <input id="newAdminKey" type="text" placeholder="至少 12 个字符，留空则随机生成" autocomplete="off">
+          </label>
+          <div style="display:flex;gap:9px;margin-top:12px;flex-wrap:wrap">
+            <button class="btn primary" id="saveAdminKey">修改密钥</button>
+            <button class="btn" id="randomAdminKey">随机生成并修改</button>
+          </div>
+          <div id="adminKeyBox"></div>
+        </div>
       </div>
       <div class="card" style="margin-top:14px">
         <div class="card-head"><div><h3>接入方式</h3><div class="hint">把 Base URL 与 API Key 填进任意 OpenAI 兼容客户端</div></div></div>
@@ -953,6 +964,24 @@ async function applyVersion(tag){
     toast('服务正在重启，请稍后刷新页面', 'warn');
   } catch (error) { toast(error.message, 'bad'); }
 }
+async function changeAdminKey(value){
+  if (value && value.length < 12) return toast('Admin Key 至少 12 个字符', 'warn');
+  if (value && !confirm('修改后旧密钥立即失效，其他已登录的浏览器需要重新登录。确认继续？')) return;
+  try {
+    const result = await api('/v1/admin/admin-key', { method: 'POST', body: JSON.stringify({ key: value }) });
+    state.adminKey = result.key;
+    localStorage.setItem(KEY_STORAGE, result.key);
+    $('#newAdminKey').value = '';
+    $('#adminKeyBox').innerHTML = `<div class="secret" style="margin-top:12px"><span class="value">${esc(result.key)}</span>
+      <button class="btn sm" id="copyAdminKey">复制</button></div>
+      <div class="hint" style="margin-top:8px">已写入 <span class="mono">${esc(result.path || '')}</span>，当前浏览器已自动切换到新密钥。</div>`;
+    $('#copyAdminKey').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(result.key); toast('已复制新的 Admin Key'); }
+      catch { toast('复制失败，请手动选择文本', 'warn'); }
+    });
+    toast('Admin Key 已更新');
+  } catch (error) { toast(error.message, 'bad'); }
+}
 async function refreshAll(silent){
   try {
     await loadStats();
@@ -1128,6 +1157,9 @@ function bind(){
     await loadUpdate();
     openUpdateModal();
   });
+  $('#saveAdminKey').addEventListener('click', () => changeAdminKey($('#newAdminKey').value.trim()));
+  $('#randomAdminKey').addEventListener('click', () => changeAdminKey(''));
+  $('#newAdminKey').addEventListener('keydown', event => { if (event.key === 'Enter') $('#saveAdminKey').click(); });
   $('#updateClose').addEventListener('click', closeUpdateModal);
   $('#updateModal').addEventListener('click', event => { if (event.target === $('#updateModal')) closeUpdateModal(); });
   $('#releaseList').addEventListener('change', event => {
