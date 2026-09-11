@@ -31,16 +31,21 @@ mk2api status
 ## 一键安装（macOS）
 
 ```bash
-bash -c "$(curl -fsSL 'https://monkeycode-ai.com/online/install')"
-```
-
-也可以使用 GitHub Raw 安装入口：
-
-```bash
 bash -c "$(curl -fsSL 'https://raw.githubusercontent.com/co0ontty/mk-to-api/main/online/install')"
 ```
 
-`install.sh` 与 `./start.sh` 使用相同逻辑：下载 Release 产物、安装 `mk2api`、写入 `~/.mk2api`、注册 launchd 并启动。
+安装脚本会下载 Release 产物、安装 `mk2api`、写入 `~/.mk2api`，然后用 launchd 在后台启动（不是前台常驻）。完成后会打印管理界面地址：
+
+```text
+http://127.0.0.1:8123/admin
+```
+
+浏览器打开该地址，用 `~/.mk2api/admin.key` 登录。也可以执行：
+
+```bash
+open http://127.0.0.1:8123/admin
+mk2api dashboard
+```
 
 ## 配置
 

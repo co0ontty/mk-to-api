@@ -121,6 +121,20 @@ fn display_host(host: &str) -> &str {
     }
 }
 
+fn print_access_info(config: &MkConfig) {
+    let host = display_host(&config.host);
+    let port = config.port;
+    println!("mk2api is running on http://{host}:{port}");
+    println!("管理界面: http://{host}:{port}/admin");
+    println!("打开方式: 浏览器访问上面的地址，或执行  open http://{host}:{port}/admin");
+    println!("          也可执行  mk2api dashboard");
+    println!("Admin Key: {}", admin_key_path().display());
+    if let Ok(path) = config_path() {
+        println!("config: {}", path.display());
+    }
+    println!("log: {}", log_path().display());
+}
+
 fn print_help() {
     print!(
         "\
@@ -386,11 +400,7 @@ async fn health(config: &MkConfig) -> bool {
 async fn start() -> Result<(), BoxError> {
     let mut config = setup(false)?;
     if service_is_ours() && health(&config).await {
-        println!(
-            "mk2api is already running on http://{}:{}",
-            display_host(&config.host),
-            config.port
-        );
+        print_access_info(&config);
         return Ok(());
     }
     if service_is_ours() {
@@ -419,15 +429,7 @@ async fn start() -> Result<(), BoxError> {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(8) {
         if health(&config).await {
-            println!(
-                "mk2api is running on http://{}:{}",
-                display_host(&config.host),
-                config.port
-            );
-            println!("admin: http://{}:{}/admin", display_host(&config.host), config.port);
-            println!("web console: mk2api dashboard");
-            println!("config: {}", config_path()?.display());
-            println!("log: {}", log_path().display());
+            print_access_info(&config);
             return Ok(());
         }
         thread::sleep(Duration::from_millis(200));
@@ -457,16 +459,7 @@ fn stop() -> Result<(), BoxError> {
 async fn status() -> Result<(), BoxError> {
     let config = load_or_default()?;
     if service_is_ours() && health(&config).await {
-        println!(
-            "mk2api is running on http://{}:{}",
-            display_host(&config.host),
-            config.port
-        );
-        println!(
-            "web console: http://{}:{}/admin",
-            display_host(&config.host),
-            config.port
-        );
+        print_access_info(&config);
         return Ok(());
     }
     if service_loaded() {

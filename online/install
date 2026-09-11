@@ -5,6 +5,13 @@ REPO="${MONKEYCODE_REPO:-co0ontty/mk-to-api}"
 VERSION="${MONKEYCODE_VERSION:-latest}"
 INSTALL_ROOT="${MONKEYCODE_INSTALL_ROOT:-$HOME/.local/lib/mk2api}"
 BIN_DIR="${MONKEYCODE_BIN_DIR:-$HOME/.local/bin}"
+CONFIG_DIR="${MK2API_HOME:-$HOME/.mk2api}"
+LABEL="com.monkeycode.mk2api"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+LOG="$HOME/Library/Logs/mk2api.log"
+UID_NUM="$(id -u)"
+DOMAIN="gui/${UID_NUM}"
+TARGET="${DOMAIN}/${LABEL}"
 
 case "$(uname -s)" in
   Darwin) ;;
@@ -28,6 +35,202 @@ else
   LEGACY_URL="https://github.com/${REPO}/releases/download/${TAG}/${LEGACY_ASSET}"
 fi
 
+xml_escape() {
+  local s=$1
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  s=${s//\"/&quot;}
+  printf '%s' "$s"
+}
+
+port_busy() {
+  (echo >/dev/tcp/127.0.0.1/"$1") >/dev/null 2>&1
+}
+
+pick_port() {
+  local preferred="$1" port
+  for port in $(seq "$preferred" $((preferred + 100))); do
+    if ! port_busy "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+  done
+  echo "no free port found from ${preferred}" >&2
+  return 1
+}
+
+read_preferred_port() {
+  local port=""
+  if [ -f "$CONFIG_DIR/port" ]; then
+    port="$(tr -d '[:space:]' < "$CONFIG_DIR/port" || true)"
+  fi
+  if [ -z "$port" ] && [ -f "$CONFIG_DIR/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    port="$(python3 -c 'import json,sys
+print(int(json.load(open(sys.argv[1])).get("port", 8123)))' "$CONFIG_DIR/config.json" 2>/dev/null || true)"
+  fi
+  case "$port" in
+    ''|*[!0-9]*) printf '8123\n' ;;
+    *) printf '%s\n' "$port" ;;
+  esac
+}
+
+ensure_config() {
+  local port="$1"
+  mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$CONFIG_DIR/config.json" ]; then
+    cat > "$CONFIG_DIR/config.json" <<EOF
+{
+  "host": "0.0.0.0",
+  "port": ${port},
+  "auth_required": true
+}
+EOF
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+path, port = sys.argv[1], int(sys.argv[2])
+try:
+    data = json.load(open(path))
+except Exception:
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+data["port"] = port
+data.setdefault("host", "0.0.0.0")
+data.setdefault("auth_required", True)
+open(path, "w").write(json.dumps(data, indent=2) + "\n")
+' "$CONFIG_DIR/config.json" "$port"
+  fi
+  chmod 600 "$CONFIG_DIR/config.json" 2>/dev/null || true
+  printf '%s\n' "$port" > "$CONFIG_DIR/port"
+  chmod 600 "$CONFIG_DIR/port" 2>/dev/null || true
+}
+
+write_plist() {
+  local binary="$1" port="$2"
+  mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+  local bin_esc work_esc home_esc cfg_esc log_esc
+  bin_esc="$(xml_escape "$binary")"
+  work_esc="$(xml_escape "$(dirname "$binary")")"
+  home_esc="$(xml_escape "$CONFIG_DIR")"
+  cfg_esc="$(xml_escape "$CONFIG_DIR/config.json")"
+  log_esc="$(xml_escape "$LOG")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bin_esc}</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>${work_esc}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MK2API_HOME</key>
+    <string>${home_esc}</string>
+    <key>MK2API_CONFIG</key>
+    <string>${cfg_esc}</string>
+    <key>MONKEYCODE_CONFIG_DIR</key>
+    <string>${home_esc}</string>
+    <key>MONKEYCODE_GATEWAY_CONFIG</key>
+    <string>${cfg_esc}</string>
+    <key>DIRECT_GATEWAY_HOST</key>
+    <string>0.0.0.0</string>
+    <key>DIRECT_GATEWAY_PORT</key>
+    <string>${port}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>${log_esc}</string>
+  <key>StandardErrorPath</key>
+  <string>${log_esc}</string>
+</dict>
+</plist>
+EOF
+  chmod 600 "$PLIST"
+}
+
+start_background() {
+  local binary="$1" port="$2"
+  write_plist "$binary" "$port"
+  /bin/launchctl bootout "$TARGET" >/dev/null 2>&1 || true
+  sleep 0.3
+  if /bin/launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "launchd bootstrap failed; starting with nohup instead" >&2
+  nohup env \
+    MK2API_HOME="$CONFIG_DIR" \
+    MK2API_CONFIG="$CONFIG_DIR/config.json" \
+    MONKEYCODE_CONFIG_DIR="$CONFIG_DIR" \
+    MONKEYCODE_GATEWAY_CONFIG="$CONFIG_DIR/config.json" \
+    DIRECT_GATEWAY_HOST="0.0.0.0" \
+    DIRECT_GATEWAY_PORT="$port" \
+    "$binary" serve >>"$LOG" 2>&1 &
+  disown || true
+}
+
+wait_health() {
+  local port="$1" i
+  for i in $(seq 1 40); do
+    if curl -fsS --max-time 1 "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"ok":true'; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+admin_key_file() {
+  local candidate
+  for candidate in "$CONFIG_DIR/admin.key" \
+    "$HOME/Library/Application Support/com.chaitin.baizhi.monkeycode/admin.key"; do
+    if [ -s "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_access() {
+  local port="$1"
+  local admin_file=""
+  admin_file="$(admin_key_file || true)"
+
+  printf '\n----------------------------------------\n'
+  printf '服务已在后台运行（开机自启）\n'
+  printf '管理界面: http://127.0.0.1:%s/admin\n' "$port"
+  printf '打开方式: 用浏览器访问上面的地址\n'
+  printf '          或执行:  open http://127.0.0.1:%s/admin\n' "$port"
+  if [ -n "$admin_file" ]; then
+    printf 'Admin Key: %s\n' "$admin_file"
+    printf '查看 Key:  cat %s\n' "$admin_file"
+  else
+    printf 'Admin Key 将写入: %s/admin.key\n' "$CONFIG_DIR"
+    printf '查看 Key:  cat %s/admin.key\n' "$CONFIG_DIR"
+  fi
+  if [ "${ARCHIVE_BIN:-}" = "mk2api" ]; then
+    printf '也可以执行: %s/mk2api dashboard\n' "$BIN_DIR"
+    printf '服务管理:   %s/mk2api status | stop | restart\n' "$BIN_DIR"
+  else
+    printf '停止服务:   launchctl bootout %s\n' "$TARGET"
+  fi
+  printf '日志:       %s\n' "$LOG"
+  printf '----------------------------------------\n'
+}
+
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mk2api-install.XXXXXX")"
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
@@ -40,14 +243,14 @@ fi
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 tar -xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
 
-BIN=""
+ARCHIVE_BIN=""
 for candidate in mk2api monkeycode-direct-gateway; do
   if [ -x "$TMP_DIR/$candidate" ]; then
-    BIN="$candidate"
+    ARCHIVE_BIN="$candidate"
     break
   fi
 done
-if [ -z "$BIN" ]; then
+if [ -z "$ARCHIVE_BIN" ]; then
   echo "Release archive does not contain mk2api" >&2
   exit 1
 fi
@@ -55,7 +258,7 @@ if [ ! -f "$TMP_DIR/VERSION" ]; then
   printf '%s\n' "$VERSION" > "$TMP_DIR/VERSION"
 fi
 
-install -m 755 "$TMP_DIR/$BIN" "$INSTALL_ROOT/mk2api"
+install -m 755 "$TMP_DIR/$ARCHIVE_BIN" "$INSTALL_ROOT/mk2api"
 install -m 644 "$TMP_DIR/VERSION" "$INSTALL_ROOT/VERSION"
 ln -sfn "$INSTALL_ROOT/mk2api" "$BIN_DIR/mk2api"
 if [ -x "$INSTALL_ROOT/mk2api" ]; then
@@ -64,10 +267,27 @@ fi
 
 printf '\nInstalled mk2api to %s\n' "$INSTALL_ROOT"
 printf 'Command: %s/mk2api\n' "$BIN_DIR"
-printf 'Config: %s/.mk2api\n' "$HOME"
+printf 'Config:  %s\n' "$CONFIG_DIR"
 
 if [ "${MONKEYCODE_GATEWAY_START:-1}" = "1" ]; then
-  MK2API_NONINTERACTIVE=1 "$BIN_DIR/mk2api" start
+  /bin/launchctl bootout "$TARGET" >/dev/null 2>&1 || true
+  sleep 0.3
+  PREFERRED="$(read_preferred_port)"
+  PORT="$(pick_port "$PREFERRED")"
+  if [ "$PORT" != "$PREFERRED" ]; then
+    printf 'port %s is occupied; using available port %s\n' "$PREFERRED" "$PORT"
+  fi
+  ensure_config "$PORT"
+  start_background "$BIN_DIR/mk2api" "$PORT"
+  if wait_health "$PORT"; then
+    print_access "$PORT"
+  else
+    printf 'failed to start mk2api; see %s\n' "$LOG" >&2
+    print_access "$PORT"
+    exit 1
+  fi
 else
+  PREFERRED="$(read_preferred_port)"
   printf 'Automatic start disabled. Run: %s/mk2api start\n' "$BIN_DIR"
+  printf '管理界面: http://127.0.0.1:%s/admin\n' "$PREFERRED"
 fi
