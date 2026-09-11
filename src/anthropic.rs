@@ -55,17 +55,49 @@ fn text_from_content(content: Option<&Value>) -> String {
     }
 }
 
+fn tool_result_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(tool_result_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").or_else(|| map.get("output")).and_then(Value::as_str) {
+                if !text.is_empty() {
+                    return text.to_string();
+                }
+            }
+            if let Some(content) = map.get("content") {
+                let nested = tool_result_text(content);
+                if !nested.is_empty() {
+                    return nested;
+                }
+            }
+            value.to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 fn content_blocks(content: Option<&Value>, for_assistant: bool) -> Vec<Value> {
     match content {
-        Some(Value::String(text)) => vec![json!({"type": "text", "text": text})],
+        Some(Value::String(text)) if !text.is_empty() => vec![json!({"type": "text", "text": text})],
         Some(Value::Array(parts)) => parts
             .iter()
             .filter_map(|part| match part {
-                Value::String(text) => Some(json!({"type": "text", "text": text})),
+                Value::String(text) if !text.is_empty() => Some(json!({"type": "text", "text": text})),
                 Value::Object(map) => {
                     let kind = map.get("type").and_then(Value::as_str).unwrap_or("text");
                     if matches!(kind, "text" | "input_text" | "output_text") {
-                        Some(json!({"type": "text", "text": map.get("text").and_then(Value::as_str).unwrap_or("")}))
+                        let text = map.get("text").and_then(Value::as_str).unwrap_or("");
+                        if text.is_empty() {
+                            None
+                        } else {
+                            Some(json!({"type": "text", "text": text}))
+                        }
                     } else if !for_assistant && kind == "input_image" {
                         if let Some(url) = map.get("image_url").and_then(Value::as_str) {
                             Some(json!({"type": "image", "source": {"type": "url", "url": url}}))
@@ -227,10 +259,7 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
             let output = map
                 .get("output")
                 .or_else(|| map.get("content"))
-                .map(|value| match value {
-                    Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                })
+                .map(tool_result_text)
                 .unwrap_or_default();
             push_message(
                 &mut messages,
@@ -253,7 +282,7 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
         }
     }
     if messages.is_empty() {
-        messages.push(json!({"role": "user", "content": [{"type": "text", "text": ""}]}));
+        messages.push(json!({"role": "user", "content": [{"type": "text", "text": "Continue."}]}));
     }
     let mut max_tokens = body
         .get("max_output_tokens")
@@ -1105,6 +1134,19 @@ mod tests {
         assert_eq!(outgoing["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(outgoing["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(outgoing["tools"][0]["name"], "bash");
+    }
+
+    #[test]
+    fn function_call_output_extracts_text_parts() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "bash", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "hello"}]}
+            ]
+        });
+        let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-v4-flash", 16);
+        assert_eq!(outgoing["messages"][2]["content"][0]["content"], "hello");
     }
 
     #[test]

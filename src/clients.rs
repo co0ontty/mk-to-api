@@ -7,8 +7,34 @@ use std::{
 };
 
 const PROVIDER: &str = "mk2api";
-const PI_CONTEXT_WINDOW: u64 = 1_000_000;
-const PI_MAX_TOKENS: u64 = 32_000;
+const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+const DEFAULT_MAX_OUTPUT: u64 = 32_000;
+
+/// 网关目录里的一条模型：id、协议、以及从 OhMyAgent / 上游错误动态得到的窗口。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub anthropic: bool,
+    pub context_window: u64,
+    pub max_output: u64,
+}
+
+impl ModelInfo {
+    pub fn advertised_context(&self) -> u64 {
+        let reserve = self.max_output.min(self.context_window / 5);
+        self.context_window.saturating_sub(reserve).max(16_384)
+    }
+}
+
+pub fn model_ids(models: &[ModelInfo]) -> Vec<String> {
+    models.iter().map(|model| model.id.clone()).collect()
+}
+
+fn meta_for<'a>(models: &'a [ModelInfo], id: &str) -> Option<&'a ModelInfo> {
+    models.iter().find(|model| model.id == id).or_else(|| {
+        models.iter().find(|model| short_id(&model.id) == id)
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientReport {
@@ -144,17 +170,19 @@ pub fn preferred_default_model(ids: &[String], current: Option<&str>) -> String 
     ids.first().cloned().unwrap_or_else(|| "qwen3.8-flash".to_string())
 }
 
-pub fn pi_models_payload(base_url: &str, api_key: &str, ids: &[String]) -> Value {
-    let models = ordered_model_ids(ids)
+pub fn pi_models_payload(base_url: &str, api_key: &str, models: &[ModelInfo]) -> Value {
+    let ids = model_ids(models);
+    let payload_models = ordered_model_ids(&ids)
         .into_iter()
         .map(|id| {
+            let meta = meta_for(models, &id);
             json!({
                 "id": id,
                 "name": display_name(&id),
                 "reasoning": true,
                 "input": ["text", "image"],
-                "contextWindow": PI_CONTEXT_WINDOW,
-                "maxTokens": PI_MAX_TOKENS
+                "contextWindow": meta.map(ModelInfo::advertised_context).unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                "maxTokens": meta.map(|model| model.max_output).unwrap_or(DEFAULT_MAX_OUTPUT)
             })
         })
         .collect::<Vec<_>>();
@@ -164,7 +192,7 @@ pub fn pi_models_payload(base_url: &str, api_key: &str, ids: &[String]) -> Value
                 "baseUrl": base_url,
                 "api": "openai-responses",
                 "apiKey": api_key,
-                "models": models
+                "models": payload_models
             }
         }
     })
@@ -226,12 +254,13 @@ pub fn extract_codex_key(text: &str) -> Option<String> {
     tables.iter().find_map(|(_, body)| extract_toml_string(body, "experimental_bearer_token"))
 }
 
-pub fn patch_codex_toml(current: &str, base_url: &str, api_key: &str, default_model: &str, catalog_path: &str) -> String {
+pub fn patch_codex_toml(current: &str, base_url: &str, api_key: &str, default_model: &str, catalog_path: &str, context_window: u64) -> String {
     let (preamble, tables) = split_toml(current);
     let mut preamble = set_preamble_key(&preamble, "model_provider", &quote(PROVIDER));
     preamble = set_preamble_key(&preamble, "model", &quote(default_model));
     preamble = set_preamble_key(&preamble, "review_model", &quote(default_model));
     preamble = set_preamble_key(&preamble, "model_catalog_json", &quote(catalog_path));
+    preamble = set_preamble_key(&preamble, "model_context_window", &context_window.to_string());
 
     let mut kept = Vec::new();
     for (name, body) in tables {
@@ -250,8 +279,9 @@ pub fn patch_codex_toml(current: &str, base_url: &str, api_key: &str, default_mo
     join_toml(&preamble, &kept)
 }
 
-pub fn codex_catalog(ids: &[String]) -> Value {
-    let models = unique_short_ids(ids)
+pub fn codex_catalog(models: &[ModelInfo]) -> Value {
+    let ids = model_ids(models);
+    let catalog = unique_short_ids(&ids)
         .into_iter()
         .enumerate()
         .map(|(index, slug)| {
@@ -260,6 +290,8 @@ pub fn codex_catalog(ids: &[String]) -> Value {
                 .find(|id| *id == &slug || short_id(id) == slug && id.contains('/'))
                 .cloned()
                 .unwrap_or_else(|| slug.clone());
+            let meta = meta_for(models, &full).or_else(|| meta_for(models, &slug));
+            let context_window = meta.map(ModelInfo::advertised_context).unwrap_or(DEFAULT_CONTEXT_WINDOW);
             let pretty = pretty_short(&slug);
             let effort = default_effort(&full);
             json!({
@@ -277,8 +309,8 @@ pub fn codex_catalog(ids: &[String]) -> Value {
                 "visibility": "list",
                 "supported_in_api": true,
                 "priority": 100u64.saturating_sub((index as u64) * 5),
-                "context_window": PI_CONTEXT_WINDOW,
-                "max_context_window": PI_CONTEXT_WINDOW,
+                "context_window": context_window,
+                "max_context_window": context_window,
                 "input_modalities": ["text", "image"],
                 "supports_parallel_tool_calls": true,
                 "supports_search_tool": false,
@@ -323,7 +355,7 @@ pub fn codex_catalog(ids: &[String]) -> Value {
             })
         })
         .collect::<Vec<_>>();
-    json!({ "models": models })
+    json!({ "models": catalog })
 }
 
 pub fn load_store(path: &Path) -> ClientStore {
@@ -574,7 +606,8 @@ pub fn report_json(reports: &[ClientReport], enabled: bool, base_url: &str, cata
     })
 }
 
-pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, ids: &[String]) -> io::Result<ClientReport> {
+pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[ModelInfo]) -> io::Result<ClientReport> {
+    let ids = model_ids(models);
     if !paths.pi_detected() {
         return Ok(ClientReport {
             name: "pi".into(),
@@ -595,13 +628,13 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, ids: &[Strin
             message: "catalog empty".into(),
         });
     }
-    let models = pi_models_payload(base_url, api_key, ids);
+    let payload = pi_models_payload(base_url, api_key, models);
     let current_models = read_json_or_empty(&paths.pi_models);
-    if !same_json(&current_models, &models) {
-        write_pretty_json(&paths.pi_models, &models)?;
+    if !same_json(&current_models, &payload) {
+        write_pretty_json(&paths.pi_models, &payload)?;
     }
     let current_settings = read_json_or_empty(&paths.pi_settings);
-    let default_model = preferred_default_model(ids, extract_pi_default_model(&current_settings).as_deref());
+    let default_model = preferred_default_model(&ids, extract_pi_default_model(&current_settings).as_deref());
     let settings = patch_pi_settings(current_settings.clone(), &default_model);
     if !same_json(&current_settings, &settings) {
         write_pretty_json(&paths.pi_settings, &settings)?;
@@ -611,12 +644,13 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, ids: &[Strin
         detected: true,
         managed: true,
         path: Some(paths.pi_models.display().to_string()),
-        models: ordered_model_ids(ids).len(),
+        models: ordered_model_ids(&ids).len(),
         message: format!("default {default_model}"),
     })
 }
 
-pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, ids: &[String]) -> io::Result<ClientReport> {
+pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[ModelInfo]) -> io::Result<ClientReport> {
+    let ids = model_ids(models);
     if !paths.codex_detected() {
         return Ok(ClientReport {
             name: "codex".into(),
@@ -655,14 +689,15 @@ pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, ids: &[St
                 .unwrap_or_else(|| value.to_string())
         })
         .unwrap_or_else(|| "~/.codex/codex-models.json".to_string());
-    let short_ids = unique_short_ids(ids);
+    let short_ids = unique_short_ids(&ids);
     let current_model = extract_toml_string(&current, "model");
     let default_model = preferred_default_model(&short_ids, current_model.as_deref());
-    let next = patch_codex_toml(&current, base_url, api_key, &default_model, &catalog_display);
+    let context_window = meta_for(models, &default_model).map(ModelInfo::advertised_context).unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let next = patch_codex_toml(&current, base_url, api_key, &default_model, &catalog_display, context_window);
     if current != next {
         write_private(&paths.codex_config, &next)?;
     }
-    let catalog = codex_catalog(ids);
+    let catalog = codex_catalog(models);
     let existing_catalog = read_json_or_empty(&catalog_path);
     if !same_json(&existing_catalog, &catalog) {
         write_pretty_json(&catalog_path, &catalog)?;
@@ -722,11 +757,18 @@ mod tests {
 
     #[test]
     fn pi_payload_keeps_only_mk2api() {
-        let payload = pi_models_payload("http://127.0.0.1:8124/v1", "mk_live_test", &["monkeycode-basic/qwen3.8-flash".into()]);
+        let payload = pi_models_payload("http://127.0.0.1:8124/v1", "mk_live_test", &[ModelInfo {
+            id: "monkeycode-basic/qwen3.8-flash".into(),
+            anthropic: false,
+            context_window: 200_000,
+            max_output: 32_000,
+        }]);
         assert_eq!(payload["providers"].as_object().unwrap().len(), 1);
         assert_eq!(payload["providers"]["mk2api"]["apiKey"], "mk_live_test");
         assert_eq!(payload["providers"]["mk2api"]["models"][0]["id"], "monkeycode-basic/qwen3.8-flash");
         assert_eq!(payload["providers"]["mk2api"]["models"][1]["id"], "qwen3.8-flash");
+        assert_eq!(payload["providers"]["mk2api"]["models"][0]["contextWindow"], 168_000);
+        assert_eq!(payload["providers"]["mk2api"]["models"][0]["maxTokens"], 32_000);
     }
 
     #[test]
@@ -753,7 +795,9 @@ goals = true
             "mk_live_test",
             "qwen3.8-flash",
             "~/.codex/codex-models.json",
+            168_000,
         );
+        assert!(next.contains("model_context_window = 168000"));
         assert!(next.contains("model_provider = \"mk2api\""));
         assert!(next.contains("[model_providers.mk2api]"));
         assert!(next.contains("experimental_bearer_token = \"mk_live_test\""));

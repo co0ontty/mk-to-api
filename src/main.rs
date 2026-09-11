@@ -1026,6 +1026,37 @@ fn models_for_upstream(settings: &Value, base_url: &str) -> Vec<Value> {
     }).collect()
 }
 
+fn all_models(settings: &Value) -> Vec<Value> {
+    settings.get("models").and_then(Value::as_object).into_iter().flat_map(|models| models.values().cloned()).collect()
+}
+
+fn short_model_name(model: &str) -> &str {
+    for prefix in ["monkeycode-basic/", "monkeycode-pro/", "monkeycode-ultra/"] {
+        if let Some(short) = model.strip_prefix(prefix) {
+            return short;
+        }
+    }
+    model
+}
+
+/// 先在当前上游目录里解析；没有时再看 OhMyAgent 里其它 provider 的同名模型。
+/// 后者仍走 MonkeyCode 签名代理，避免 Codex 会话在目录刷新后立刻 404。
+fn resolve_model_for_runtime<'a>(filtered: &'a [Value], all: &'a [Value], requested: &str) -> Option<(&'a Value, bool)> {
+    if let Some(found) = resolve_model(filtered, requested) {
+        return Some((found, false));
+    }
+    if let Some(found) = resolve_model(all, requested) {
+        return Some((found, true));
+    }
+    let short = short_model_name(requested);
+    if short != requested {
+        if let Some(found) = resolve_model(filtered, short).or_else(|| resolve_model(all, short)) {
+            return Some((found, true));
+        }
+    }
+    None
+}
+
 async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime, GatewayError> {
     let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
     let key_config = key_config?; let settings = settings?;
@@ -1033,10 +1064,24 @@ async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime,
     let upstream_key = config.upstream_key.clone().or_else(|| key_config.get("api_key").and_then(Value::as_str).map(str::to_string));
     let signing_secret = config.signing_secret.clone().or_else(|| key_config.get("signing_secret").and_then(Value::as_str).map(str::to_string));
     if base_url.is_empty() || upstream_key.as_deref().unwrap_or("").is_empty() || signing_secret.as_deref().unwrap_or("").is_empty() { return Err(GatewayError::config("gateway configuration is missing upstream_host, upstream_key, or signing_secret")); }
-    let models = models_for_upstream(&settings, &base_url);
-    let Some(model_config) = resolve_model(&models, requested_model) else { return Err(GatewayError::new(StatusCode::NOT_FOUND, format!("model is not configured: {requested_model}")).with_code("model_not_found")); };
-    let model = model_config.get("model").and_then(Value::as_str).unwrap_or(requested_model).to_string();
-    let api_key = model_config.get("api_key").and_then(Value::as_str).unwrap_or(upstream_key.as_deref().unwrap()).to_string();
+    let filtered = models_for_upstream(&settings, &base_url);
+    let all = all_models(&settings);
+    let Some((model_config, fallback)) = resolve_model_for_runtime(&filtered, &all, requested_model) else { return Err(GatewayError::new(StatusCode::NOT_FOUND, format!("model is not configured: {requested_model}")).with_code("model_not_found")); };
+    let found_model = model_config.get("model").and_then(Value::as_str).unwrap_or(requested_model);
+    let model = if fallback {
+        if requested_model.contains('/') {
+            requested_model.to_string()
+        } else {
+            format!("monkeycode-basic/{}", short_model_name(found_model))
+        }
+    } else {
+        found_model.to_string()
+    };
+    let api_key = if fallback {
+        upstream_key.as_deref().unwrap().to_string()
+    } else {
+        model_config.get("api_key").and_then(Value::as_str).unwrap_or(upstream_key.as_deref().unwrap()).to_string()
+    };
     Ok(Runtime {
         base_url,
         api_key,
@@ -1047,38 +1092,83 @@ async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime,
     })
 }
 
-async fn configured_model_ids(config: &Config) -> Result<Vec<String>, GatewayError> {
+fn model_limits_path(config: &Config) -> PathBuf {
+    mk2api_home(config).join("model-limits.json")
+}
+
+fn load_learned_limits(path: &Path) -> std::collections::HashMap<String, u64> {
+    let Ok(text) = std::fs::read_to_string(path) else { return std::collections::HashMap::new(); };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else { return std::collections::HashMap::new(); };
+    let Some(limits) = value.get("limits").and_then(Value::as_object) else { return std::collections::HashMap::new(); };
+    limits.iter().filter_map(|(key, value)| value.as_u64().or_else(|| value.get("context_window").and_then(Value::as_u64)).map(|limit| (key.clone(), limit))).collect()
+}
+
+fn remember_context_limit(path: &Path, model: &str, limit: u64) {
+    let mut limits = load_learned_limits(path);
+    limits.insert(model.to_string(), limit);
+    limits.insert(short_model_name(model).to_string(), limit);
+    let object = limits.into_iter().map(|(key, value)| (key, json!(value))).collect::<serde_json::Map<String, Value>>();
+    let _ = clients::write_pretty_json(path, &json!({"limits": object, "updated_at": now()}));
+}
+
+fn parse_context_limit(message: &str) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("token") {
+        return None;
+    }
+    for prefix in ["maximum context length is ", "max context length is ", "context length is ", "context window is "] {
+        if let Some(index) = lower.find(prefix) {
+            let digits: String = lower[index + prefix.len()..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if let Ok(limit) = digits.parse::<u64>() {
+                if (8_192..16_000_000).contains(&limit) {
+                    return Some(limit);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn push_model_info(catalog: &mut Vec<clients::ModelInfo>, id: &str, anthropic: bool, context_window: u64, max_output: u64) {
+    if catalog.iter().any(|existing| existing.id == id) {
+        return;
+    }
+    catalog.push(clients::ModelInfo {
+        id: id.to_string(),
+        anthropic,
+        context_window,
+        max_output,
+    });
+}
+
+async fn configured_model_infos(config: &Config) -> Result<Vec<clients::ModelInfo>, GatewayError> {
     let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
     let key_config = key_config?; let settings = settings?;
     let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
-    let mut ids = Vec::new();
-    for id in models_for_upstream(&settings, &base_url).iter().filter_map(|entry| entry.get("model").and_then(Value::as_str)) {
-        let id = id.to_string();
-        if !ids.contains(&id) { ids.push(id.clone()); }
-        let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1);
-        if !ids.contains(&short) { ids.push(short); }
-    }
-    Ok(ids)
-}
-
-/// 模型目录：`(模型 id, 是否为 anthropic 协议)`。
-///
-/// 与 `configured_model_ids()` 的差别：后者只给调用方一串 id（用于写客户端配置），
-/// 这里额外带上协议类型，供看板「模型」页展示并区分 `/responses` 与 `/messages` 路由。
-async fn configured_model_catalog(config: &Config) -> Vec<(String, bool)> {
-    let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
-    let (Ok(key_config), Ok(settings)) = (key_config, settings) else { return Vec::new(); };
-    let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
-    let mut catalog: Vec<(String, bool)> = Vec::new();
+    let learned = load_learned_limits(&model_limits_path(config));
+    let mut catalog = Vec::new();
     for entry in models_for_upstream(&settings, &base_url) {
         let Some(id) = entry.get("model").and_then(Value::as_str) else { continue; };
-        let is_anthropic = anthropic::is_anthropic_type(entry.get("type").and_then(Value::as_str));
-        let short = id.replacen("monkeycode-basic/", "", 1).replacen("monkeycode-pro/", "", 1).replacen("monkeycode-ultra/", "", 1);
-        // 完整 id 与短别名都登记；重名时以先出现的为准，保证顺序稳定。
-        if !catalog.iter().any(|(existing, _)| existing == id) { catalog.push((id.to_string(), is_anthropic)); }
-        if short != id && !catalog.iter().any(|(existing, _)| existing == &short) { catalog.push((short, is_anthropic)); }
+        let listed = entry.get("context_window").and_then(Value::as_u64).unwrap_or(200_000);
+        let short = short_model_name(id);
+        let context_window = learned.get(id).copied().or_else(|| learned.get(short).copied()).unwrap_or(listed);
+        let max_output = entry.get("max_output").and_then(Value::as_u64).unwrap_or(32_000);
+        let anthropic = anthropic::is_anthropic_type(entry.get("type").and_then(Value::as_str));
+        push_model_info(&mut catalog, id, anthropic, context_window, max_output);
+        if short != id {
+            push_model_info(&mut catalog, short, anthropic, context_window, max_output);
+        }
     }
-    catalog
+    Ok(catalog)
+}
+
+async fn configured_model_ids(config: &Config) -> Result<Vec<String>, GatewayError> {
+    Ok(clients::model_ids(&configured_model_infos(config).await?))
+}
+
+/// 模型目录：id + 协议类型，供看板「模型」页展示。
+async fn configured_model_catalog(config: &Config) -> Vec<clients::ModelInfo> {
+    configured_model_infos(config).await.unwrap_or_default()
 }
 
 async fn request_upstream(state: &AppState, outgoing: &Value, runtime: &Runtime) -> Result<reqwest::Response, GatewayError> {
@@ -1098,18 +1188,109 @@ async fn request_upstream(state: &AppState, outgoing: &Value, runtime: &Runtime)
     request.json(outgoing).send().await.map_err(|e| GatewayError::new(StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).with_type("api_error").with_code("upstream_unavailable"))
 }
 
+fn unwrap_nested_error(value: Value) -> Value {
+    let Some(message) = value.get("message").and_then(Value::as_str) else { return value; };
+    let Ok(inner) = serde_json::from_str::<Value>(message) else { return value; };
+    unwrap_nested_error(inner.get("error").cloned().unwrap_or(inner))
+}
+
+fn parse_upstream_error_payload(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return json!({"message": "upstream request failed"});
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return unwrap_nested_error(value.get("error").cloned().unwrap_or(value));
+    }
+    if trimmed.contains("data:") {
+        let (_, data) = sse_block(trimmed);
+        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+            return unwrap_nested_error(value.get("error").cloned().unwrap_or(value));
+        }
+        if !data.is_empty() {
+            return json!({"message": data});
+        }
+    }
+    json!({"message": trimmed})
+}
+
+fn is_client_upstream_error(code: Option<&str>, message: &str) -> bool {
+    let blob = format!("{} {message}", code.unwrap_or("")).to_ascii_lowercase();
+    [
+        "invalidparameter",
+        "invalid_parameter",
+        "invalid parameter",
+        "invalid_request",
+        "context length",
+        "maximum context",
+        "context_length",
+        "input length",
+        "too many tokens",
+        "please reduce the length",
+    ].iter().any(|marker| blob.contains(marker))
+}
+
+fn classify_upstream_error(status: StatusCode, text: &str) -> GatewayError {
+    let parsed = parse_upstream_error_payload(text);
+    let message = parsed.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+        if text.trim().is_empty() { format!("upstream HTTP {status}") } else { text.chars().take(4000).collect() }
+    });
+    let code = parsed.get("code").and_then(Value::as_str);
+    let client = is_client_upstream_error(code, &message);
+    let status = if client { StatusCode::BAD_REQUEST } else { status };
+    let error_type = if client {
+        "invalid_request_error"
+    } else {
+        match parsed.get("type").and_then(Value::as_str) {
+            Some("invalid_request_error") => "invalid_request_error",
+            Some("authentication_error") => "authentication_error",
+            Some("permission_error") => "permission_error",
+            Some("api_error") => "api_error",
+            _ => "upstream_error",
+        }
+    };
+    GatewayError {
+        status,
+        message,
+        error_type,
+        code: if client { Some("invalid_request") } else { None },
+        param: parsed.get("param").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
 async fn upstream_error(response: reqwest::Response) -> GatewayError {
     let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let text = response.text().await.unwrap_or_default().chars().take(4000).collect::<String>();
-    let parsed = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("error").cloned()).unwrap_or_else(|| json!({"message": if text.is_empty() { format!("upstream HTTP {status}") } else { text }}));
-    let error_type = match parsed.get("type").and_then(Value::as_str) {
-        Some("invalid_request_error") => "invalid_request_error",
-        Some("authentication_error") => "authentication_error",
-        Some("permission_error") => "permission_error",
-        Some("api_error") => "api_error",
-        _ => "upstream_error",
-    };
-    GatewayError { status, message: parsed.get("message").and_then(Value::as_str).unwrap_or("upstream request failed").to_string(), error_type, code: None, param: parsed.get("param").and_then(Value::as_str).map(str::to_string) }
+    let error = classify_upstream_error(status, &text);
+    eprintln!("upstream error {}: {}", error.status, error.message.chars().take(400).collect::<String>());
+    error
+}
+
+fn stream_failed_responses(cors: HeaderMap, model: String, error: &GatewayError) -> Response {
+    let (tx, rx) = mpsc::channel(8);
+    let message = error.message.clone();
+    let error_type = error.error_type;
+    let code = error.code;
+    tokio::spawn(async move {
+        let id = format!("resp_{}", Uuid::new_v4());
+        let error_body = json!({"message": message, "type": error_type, "code": code});
+        let created = json!({"id": id, "object": "response", "created_at": now(), "status": "in_progress", "model": model, "output": []});
+        let failed = json!({"id": id, "object": "response", "created_at": now(), "status": "failed", "model": model, "output": [], "error": error_body});
+        let _ = send_sse(&tx, None, &json!({"type": "response.created", "sequence_number": 0, "response": created}).to_string()).await;
+        let _ = send_sse(&tx, None, &json!({"type": "response.failed", "sequence_number": 1, "response": failed, "error": failed.get("error").cloned().unwrap_or(json!({}))}).to_string()).await;
+        let _ = send_sse(&tx, None, "[DONE]").await;
+    });
+    sse_response(cors, rx)
+}
+
+fn stream_failed_chat(cors: HeaderMap, error: &GatewayError) -> Response {
+    let (tx, rx) = mpsc::channel(4);
+    let payload = json!({"error": {"message": error.message, "type": error.error_type, "code": error.code}});
+    tokio::spawn(async move {
+        let _ = send_sse(&tx, None, &payload.to_string()).await;
+        let _ = send_sse(&tx, None, "[DONE]").await;
+    });
+    sse_response(cors, rx)
 }
 
 fn response_output_text(data: &Value) -> String {
@@ -1250,9 +1431,18 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
     } else {
         match normalize_chat_request(&body, &runtime.model) { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } }
     };
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let upstream = match request_upstream(&state, &outgoing, &runtime).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
-    if !upstream.status().is_success() { let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY); let error = upstream_error(upstream).await; record_usage(&state, &key_id, &requested_model, "chat.completions", status, started, None).await; return error.into_response(); }
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+    if !upstream.status().is_success() {
+        let error = upstream_error(upstream).await;
+        if let Some(limit) = parse_context_limit(&error.message) {
+            remember_context_limit(&model_limits_path(&state.config), &requested_model, limit);
+        }
+        record_usage(&state, &key_id, &requested_model, "chat.completions", error.status, started, None).await;
+        if stream { return stream_failed_chat(cors, &error); }
+        return error.into_response();
+    }
+    if stream {
         let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx);
         if runtime.anthropic {
             let model = requested_model.clone();
@@ -1288,9 +1478,18 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     } else {
         normalize_responses_request(&body, &runtime.model, &developer_prompt(&body))
     };
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let upstream = match request_upstream(&state, &outgoing, &runtime).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", e.status, started, None).await; return e.into_response(); } };
-    if !upstream.status().is_success() { let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY); let error = upstream_error(upstream).await; record_usage(&state, &key_id, &requested_model, "responses", status, started, None).await; return error.into_response(); }
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+    if !upstream.status().is_success() {
+        let error = upstream_error(upstream).await;
+        if let Some(limit) = parse_context_limit(&error.message) {
+            remember_context_limit(&model_limits_path(&state.config), &requested_model, limit);
+        }
+        record_usage(&state, &key_id, &requested_model, "responses", error.status, started, None).await;
+        if stream { return stream_failed_responses(cors, requested_model, &error); }
+        return error.into_response();
+    }
+    if stream {
         let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx);
         if runtime.anthropic {
             let model = requested_model.clone();
@@ -1475,8 +1674,8 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     let token = request_api_key(&request).map(str::to_owned);
     let Some(key_id) = authenticated_key_id(token, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
     if request.method() == axum::http::Method::GET && (path == "/models" || path == "/v1/models") {
-        return match configured_model_ids(&state.config).await {
-            Ok(ids) => json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": ids.into_iter().map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "monkeycode"})).collect::<Vec<_>>() })),
+        return match configured_model_infos(&state.config).await {
+            Ok(models) => json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": models.into_iter().map(|model| json!({"id": model.id, "object": "model", "created": 0, "owned_by": "monkeycode", "context_window": model.advertised_context(), "max_output_tokens": model.max_output})).collect::<Vec<_>>() })),
             Err(e) => error_response(&request, &state.config, e),
         };
     }
@@ -1563,8 +1762,8 @@ async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientRep
             clients::skipped("codex", paths.codex_config, "disabled"),
         ]);
     }
-    let ids = match configured_model_ids(&state.config).await {
-        Ok(ids) => ids,
+    let models = match configured_model_infos(&state.config).await {
+        Ok(models) => models,
         Err(error) => {
             eprintln!("client sync catalog unavailable: {}", error.message);
             Vec::new()
@@ -1577,7 +1776,7 @@ async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientRep
         let preferred = store.pi.as_ref().map(|key| key.raw.clone()).or_else(|| clients::extract_pi_key(&clients::read_json_or_empty(&paths.pi_models)));
         let key = ensure_named_key(state, "pi", preferred).await?;
         store.pi = Some(key.clone());
-        reports.push(clients::apply_pi(&paths, &base_url, &key.raw, &ids)?);
+        reports.push(clients::apply_pi(&paths, &base_url, &key.raw, &models)?);
     } else {
         reports.push(clients::skipped("pi", paths.pi_models.clone(), "disabled"));
     }
@@ -1585,7 +1784,7 @@ async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientRep
         let preferred = store.codex.as_ref().map(|key| key.raw.clone()).or_else(|| std::fs::read_to_string(&paths.codex_config).ok().and_then(|text| clients::extract_codex_key(&text)));
         let key = ensure_named_key(state, "codex", preferred).await?;
         store.codex = Some(key.clone());
-        reports.push(clients::apply_codex(&paths, &base_url, &key.raw, &ids)?);
+        reports.push(clients::apply_codex(&paths, &base_url, &key.raw, &models)?);
     } else {
         reports.push(clients::skipped("codex", paths.codex_config.clone(), "disabled"));
     }
@@ -1777,5 +1976,45 @@ mod tests {
         ];
         let found = resolve_model(&models, "deepseek-v4-flash").unwrap();
         assert_eq!(found["model"], "monkeycode-basic/deepseek-v4-flash");
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_other_provider() {
+        let filtered = vec![json!({"model": "monkeycode-basic/qwen3.8-flash", "type": "openai-responses"})];
+        let all = vec![
+            json!({"model": "monkeycode-basic/qwen3.8-flash", "type": "openai-responses"}),
+            json!({"model": "deepseek-v4-flash", "type": "anthropic", "base_url": "https://ai-models.app.baizhi.cloud/api/anthropic"}),
+        ];
+        let (found, fallback) = resolve_model_for_runtime(&filtered, &all, "deepseek-v4-flash").unwrap();
+        assert!(fallback);
+        assert_eq!(found["model"], "deepseek-v4-flash");
+        assert_eq!(found["type"], "anthropic");
+        let (found, fallback) = resolve_model_for_runtime(&filtered, &all, "monkeycode-basic/deepseek-v4-flash").unwrap();
+        assert!(fallback);
+        assert_eq!(found["model"], "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn upstream_sse_invalid_parameter_is_client_error() {
+        let text = "event:error\ndata:{\"code\":\"InvalidParameter\",\"message\":\"<400> InternalError.Algo.InvalidParameter: Range of input length should be [1, 983616]\"}";
+        let error = classify_upstream_error(StatusCode::BAD_GATEWAY, text);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_type, "invalid_request_error");
+        assert!(error.message.contains("Range of input length"));
+        assert!(!error.message.starts_with("event:error"));
+    }
+
+    #[test]
+    fn upstream_nested_context_length_is_client_error() {
+        let text = r#"{"error":{"message":"{\"error\":{\"message\":\"This model's maximum context length is 1048576 tokens. However, you requested 1196894 tokens (1164894 in the messages, 32000 in the completion). Please reduce the length of the messages or completion.\",\"type\":\"invalid_request_error\"}}"}}"#;
+        let error = classify_upstream_error(StatusCode::BAD_GATEWAY, text);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("maximum context length"));
+        assert_eq!(parse_context_limit(&error.message), Some(1_048_576));
+    }
+
+    #[test]
+    fn parse_context_limit_ignores_character_input_length() {
+        assert_eq!(parse_context_limit("Range of input length should be [1, 983616]"), None);
     }
 }

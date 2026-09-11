@@ -140,14 +140,16 @@ pub fn logs(store: &UsageStore, query: &LogQuery) -> (Vec<Value>, usize) {
     (page, total)
 }
 
-/// 模型目录（含上游协议类型），用于「模型」页做交叉标注。
-pub fn models(catalog: &[(String, bool)]) -> Value {
+/// 模型目录（含上游协议类型与上下文窗口），用于「模型」页做交叉标注。
+pub fn models(catalog: &[crate::clients::ModelInfo]) -> Value {
     json!({
         "object": "list",
-        "data": catalog.iter().map(|(id, is_anthropic)| json!({
-            "id": id,
+        "data": catalog.iter().map(|model| json!({
+            "id": model.id,
             "object": "model",
-            "anthropic": is_anthropic,
+            "anthropic": model.anthropic,
+            "context_window": model.advertised_context(),
+            "max_output": model.max_output,
         })).collect::<Vec<_>>()
     })
 }
@@ -387,8 +389,19 @@ mod tests {
 
     #[test]
     fn models_expose_protocol_type() {
-        let value = models(&[("monkeycode-basic/x".to_string(), false), ("deepseek-v4-flash".to_string(), true)]);
+        let value = models(&[crate::clients::ModelInfo {
+            id: "monkeycode-basic/x".into(),
+            anthropic: false,
+            context_window: 200_000,
+            max_output: 32_000,
+        }, crate::clients::ModelInfo {
+            id: "deepseek-v4-flash".into(),
+            anthropic: true,
+            context_window: 200_000,
+            max_output: 32_000,
+        }]);
         assert_eq!(value["data"][0]["anthropic"], false);
         assert_eq!(value["data"][1]["anthropic"], true);
+        assert_eq!(value["data"][0]["context_window"], 168_000);
     }
 }
