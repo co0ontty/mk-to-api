@@ -109,6 +109,15 @@ fn content_blocks(content: Option<&Value>, for_assistant: bool) -> Vec<Value> {
                             .and_then(|value| value.get("url"))
                             .and_then(Value::as_str)
                             .map(|url| json!({"type": "image", "source": {"type": "url", "url": url}}))
+                    } else if for_assistant && matches!(kind, "thinking" | "redacted_thinking") {
+                        Some(Value::Object(map.clone()))
+                    } else if for_assistant && kind == "tool_use" {
+                        Some(json!({
+                            "type": "tool_use",
+                            "id": map.get("id").and_then(Value::as_str).unwrap_or(""),
+                            "name": map.get("name").and_then(Value::as_str).unwrap_or(""),
+                            "input": parse_arguments(map.get("input").or_else(|| map.get("arguments"))),
+                        }))
                     } else {
                         None
                     }
@@ -158,23 +167,128 @@ fn convert_tools(tools: Option<&Value>) -> Vec<Value> {
         .collect()
 }
 
-fn thinking_from_body(body: &Value) -> Option<Value> {
-    let effort = body
-        .pointer("/reasoning/effort")
-        .or_else(|| body.get("reasoning_effort"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if effort.is_empty() || effort == "off" || effort == "none" {
-        return None;
+fn effort_rank(effort: &str) -> u8 {
+    match effort.to_ascii_lowercase().as_str() {
+        "off" | "none" | "false" | "0" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" | "max" => 5,
+        _ => 3,
     }
-    let budget = match effort {
+}
+
+fn budget_for_effort(effort: &str) -> u64 {
+    match effort.to_ascii_lowercase().as_str() {
         "minimal" | "low" => 1024,
         "medium" => 4096,
         "high" => 8192,
         "xhigh" | "max" => 16384,
         _ => 4096,
+    }
+}
+
+/// `model_effort`: None = 不封顶；Some("") = 模型关闭思考；Some("low") = 不超过该档。
+fn thinking_from_body(body: &Value, model_effort: Option<&str>) -> Option<Value> {
+    if matches!(model_effort, Some("")) {
+        return None;
+    }
+    let client = body
+        .pointer("/reasoning/effort")
+        .or_else(|| body.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if client.is_empty() || matches!(client.as_str(), "off" | "none" | "false" | "0") {
+        return None;
+    }
+    let chosen = if let Some(model) = model_effort.filter(|value| !value.is_empty()) {
+        if effort_rank(model) < effort_rank(&client) {
+            model.to_ascii_lowercase()
+        } else {
+            client
+        }
+    } else {
+        client
     };
-    Some(json!({"type": "enabled", "budget_tokens": budget}))
+    Some(json!({"type": "enabled", "budget_tokens": budget_for_effort(&chosen)}))
+}
+
+fn cache_marker() -> Value {
+    json!({"type": "ephemeral"})
+}
+
+fn set_cache_control(value: &mut Value) {
+    if let Value::Object(map) = value {
+        map.insert("cache_control".into(), cache_marker());
+    }
+}
+
+fn mark_last_cacheable_block(messages: &mut [Value]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    let Some(Value::Array(content)) = last.get_mut("content") else {
+        return;
+    };
+    let Some(index) = content.iter().rposition(|block| {
+        !matches!(block.get("type").and_then(Value::as_str), Some("thinking") | Some("redacted_thinking"))
+    }) else {
+        return;
+    };
+    set_cache_control(&mut content[index]);
+}
+
+fn reasoning_to_thinking(map: &serde_json::Map<String, Value>) -> Option<Value> {
+    let signature = map
+        .get("encrypted_content")
+        .or_else(|| map.get("signature"))
+        .or_else(|| map.get("data"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let mut text = map.get("thinking").and_then(Value::as_str).unwrap_or("").to_string();
+    if text.is_empty() {
+        if let Some(Value::Array(summary)) = map.get("summary") {
+            text = summary
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|part| !part.is_empty() && *part != "[redacted]")
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    if text.is_empty() {
+        text = text_from_content(map.get("content"));
+    }
+    let redacted = map.get("type").and_then(Value::as_str) == Some("redacted_thinking") || text == "[redacted]";
+    if redacted {
+        if let Some(signature) = signature {
+            if text.is_empty() || text == "[redacted]" {
+                return Some(json!({"type": "redacted_thinking", "data": signature}));
+            }
+        }
+    }
+    if text.is_empty() && signature.is_none() {
+        return None;
+    }
+    let mut block = json!({"type": "thinking", "thinking": text});
+    if let Some(signature) = signature {
+        block["signature"] = json!(signature);
+    }
+    Some(block)
+}
+
+fn push_assistant(messages: &mut Vec<Value>, pending: &mut Vec<Value>, mut content: Vec<Value>) {
+    let mut blocks = std::mem::take(pending);
+    blocks.append(&mut content);
+    push_message(messages, "assistant", blocks);
+}
+
+fn flush_thinking(messages: &mut Vec<Value>, pending: &mut Vec<Value>) {
+    if !pending.is_empty() {
+        push_message(messages, "assistant", std::mem::take(pending));
+    }
 }
 
 fn push_message(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
@@ -204,7 +318,12 @@ fn collect_input_items(body: &Value) -> Vec<Value> {
     Vec::new()
 }
 
+#[cfg(test)]
 pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) -> Value {
+    to_anthropic_request_with(body, model, default_max_tokens, None)
+}
+
+pub fn to_anthropic_request_with(body: &Value, model: &str, default_max_tokens: u64, model_thinking_effort: Option<&str>) -> Value {
     let mut system_parts = Vec::new();
     if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
         if !instructions.is_empty() {
@@ -212,11 +331,13 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
         }
     }
     let mut messages = Vec::new();
+    let mut pending_thinking = Vec::new();
     for item in collect_input_items(body) {
         let map = match item.as_object() {
             Some(map) => map,
             None => {
                 if let Some(text) = item.as_str() {
+                    flush_thinking(&mut messages, &mut pending_thinking);
                     push_message(&mut messages, "user", vec![json!({"type": "text", "text": text})]);
                 }
                 continue;
@@ -238,9 +359,9 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let name = map.get("name").and_then(Value::as_str).unwrap_or("");
-            push_message(
+            push_assistant(
                 &mut messages,
-                "assistant",
+                &mut pending_thinking,
                 vec![json!({
                     "type": "tool_use",
                     "id": id,
@@ -251,6 +372,7 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
             continue;
         }
         if item_type == "function_call_output" || item_type == "tool_result" {
+            flush_thinking(&mut messages, &mut pending_thinking);
             let id = map
                 .get("call_id")
                 .or_else(|| map.get("tool_use_id"))
@@ -272,18 +394,29 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
             );
             continue;
         }
-        if item_type == "reasoning" {
+        if item_type == "reasoning" || item_type == "thinking" || item_type == "redacted_thinking" {
+            if let Some(block) = reasoning_to_thinking(map) {
+                pending_thinking.push(block);
+            }
             continue;
         }
         let normalized_role = if role == "assistant" { "assistant" } else { "user" };
         let blocks = content_blocks(map.get("content").or_else(|| map.get("text")), normalized_role == "assistant");
-        if !blocks.is_empty() {
-            push_message(&mut messages, normalized_role, blocks);
+        if blocks.is_empty() {
+            continue;
+        }
+        if normalized_role == "assistant" {
+            push_assistant(&mut messages, &mut pending_thinking, blocks);
+        } else {
+            flush_thinking(&mut messages, &mut pending_thinking);
+            push_message(&mut messages, "user", blocks);
         }
     }
+    flush_thinking(&mut messages, &mut pending_thinking);
     if messages.is_empty() {
         messages.push(json!({"role": "user", "content": [{"type": "text", "text": "Continue."}]}));
     }
+    mark_last_cacheable_block(&mut messages);
     let mut max_tokens = body
         .get("max_output_tokens")
         .or_else(|| body.get("max_tokens"))
@@ -298,13 +431,16 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
         "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false),
     });
     let system = system_parts.into_iter().filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n");
-    outgoing["system"] = Value::String(if system.is_empty() {
-        "You are a helpful assistant.".to_string()
-    } else {
-        system
-    });
-    let tools = convert_tools(body.get("tools"));
+    outgoing["system"] = json!([{
+        "type": "text",
+        "text": if system.is_empty() { "You are a helpful assistant.".to_string() } else { system },
+        "cache_control": cache_marker(),
+    }]);
+    let mut tools = convert_tools(body.get("tools"));
     if !tools.is_empty() {
+        if let Some(last) = tools.last_mut() {
+            set_cache_control(last);
+        }
         outgoing["tools"] = Value::Array(tools);
     }
     if let Some(tool_choice) = body.get("tool_choice") {
@@ -318,7 +454,7 @@ pub fn to_anthropic_request(body: &Value, model: &str, default_max_tokens: u64) 
             other => other.clone(),
         };
     }
-    if let Some(thinking) = thinking_from_body(body) {
+    if let Some(thinking) = thinking_from_body(body, model_thinking_effort) {
         let budget = thinking.get("budget_tokens").and_then(Value::as_u64).unwrap_or(1024);
         if max_tokens <= budget {
             max_tokens = budget + 1024;
@@ -397,20 +533,37 @@ pub fn to_responses_json(data: &Value, requested_model: &str) -> Value {
         for block in blocks {
             match block.get("type").and_then(Value::as_str) {
                 Some("thinking") | Some("redacted_thinking") => {
+                    let redacted = block.get("type").and_then(Value::as_str) == Some("redacted_thinking");
                     let thinking = block
                         .get("thinking")
-                        .or_else(|| block.get("data"))
+                        .or_else(|| if redacted { None } else { block.get("data") })
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    if thinking.is_empty() && block.get("type").and_then(Value::as_str) != Some("redacted_thinking") {
+                    if thinking.is_empty() && !redacted {
                         continue;
                     }
                     let summary = if thinking.is_empty() { "[redacted]" } else { thinking };
-                    output.push(json!({
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("rs_{}", Uuid::new_v4()));
+                    let mut item = json!({
                         "type": "reasoning",
-                        "id": format!("rs_{}", Uuid::new_v4()),
+                        "id": id,
                         "summary": [{"type": "summary_text", "text": summary}],
-                    }));
+                    });
+                    let signature = if redacted {
+                        block.get("data").or_else(|| block.get("signature"))
+                    } else {
+                        block.get("signature").or_else(|| block.get("encrypted_content"))
+                    }
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                    if let Some(signature) = signature {
+                        item["encrypted_content"] = json!(signature);
+                    }
+                    output.push(item);
                 }
                 Some("text") => {
                     let chunk = block.get("text").and_then(Value::as_str).unwrap_or("");
@@ -513,7 +666,7 @@ fn responses_event(event_type: &str, extra: Value, sequence: &mut u64) -> Value 
 enum CurrentBlock {
     None,
     Text { index: usize, id: String },
-    Reasoning { index: usize, id: String },
+    Reasoning { index: usize, id: String, signature: String },
     Tool { index: usize, id: String, name: String, arguments: String },
 }
 
@@ -588,7 +741,27 @@ impl StreamState {
             }
             Some("content_block_start") => self.start_block(event, sequence),
             Some("content_block_delta") => self.delta_block(event, sequence),
-            Some("content_block_stop") => self.close_current(sequence),
+            Some("content_block_stop") => {
+                if let Some(signature) = event
+                    .pointer("/content_block/signature")
+                    .or_else(|| event.pointer("/content_block/data"))
+                    .and_then(Value::as_str)
+                {
+                    if !signature.is_empty() {
+                        if let CurrentBlock::Reasoning { index, signature: stored, .. } = &mut self.current {
+                            if stored.is_empty() {
+                                *stored = signature.to_string();
+                            }
+                            let index = *index;
+                            let value = stored.clone();
+                            if let Some(item) = self.output.get_mut(index) {
+                                item["encrypted_content"] = json!(value);
+                            }
+                        }
+                    }
+                }
+                self.close_current(sequence)
+            }
             Some("message_delta") => {
                 if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     self.stop_reason = Some(reason.to_string());
@@ -642,6 +815,7 @@ impl StreamState {
                 ]
             }
             Some("thinking") | Some("redacted_thinking") => {
+                let redacted = event.pointer("/content_block/type").and_then(Value::as_str) == Some("redacted_thinking");
                 let id = event
                     .pointer("/content_block/id")
                     .and_then(Value::as_str)
@@ -651,14 +825,24 @@ impl StreamState {
                     .pointer("/content_block/thinking")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                let signature = event
+                    .pointer("/content_block/signature")
+                    .or_else(|| if redacted { event.pointer("/content_block/data") } else { None })
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let summary = if redacted && initial.is_empty() { "[redacted]" } else { initial };
                 let index = self.output.len();
-                let item = json!({
+                let mut item = json!({
                     "type": "reasoning",
                     "id": id,
-                    "summary": [{"type": "summary_text", "text": initial}],
+                    "summary": [{"type": "summary_text", "text": summary}],
                 });
+                if !signature.is_empty() {
+                    item["encrypted_content"] = json!(signature);
+                }
                 self.output.push(item.clone());
-                self.current = CurrentBlock::Reasoning { index, id: id.clone() };
+                self.current = CurrentBlock::Reasoning { index, id: id.clone(), signature };
                 let mut events = vec![responses_event("response.output_item.added", json!({"output_index": index, "item": item}), sequence)];
                 if !initial.is_empty() {
                     events.push(responses_event(
@@ -714,7 +898,7 @@ impl StreamState {
         }
         if let Some(thinking) = event.pointer("/delta/thinking").and_then(Value::as_str) {
             if !thinking.is_empty() {
-                if let CurrentBlock::Reasoning { index, id } = &self.current {
+                if let CurrentBlock::Reasoning { index, id, .. } = &self.current {
                     let index = *index;
                     let id = id.clone();
                     if let Some(item) = self.output.get_mut(index) {
@@ -725,6 +909,18 @@ impl StreamState {
                         json!({"item_id": id, "output_index": index, "summary_index": 0, "delta": thinking}),
                         sequence,
                     )];
+                }
+            }
+        }
+        if let Some(signature) = event.pointer("/delta/signature").and_then(Value::as_str) {
+            if !signature.is_empty() {
+                if let CurrentBlock::Reasoning { index, signature: stored, .. } = &mut self.current {
+                    stored.push_str(signature);
+                    let index = *index;
+                    let value = stored.clone();
+                    if let Some(item) = self.output.get_mut(index) {
+                        item["encrypted_content"] = json!(value);
+                    }
                 }
             }
         }
@@ -765,7 +961,12 @@ impl StreamState {
                     responses_event("response.output_item.done", json!({"output_index": index, "item": item}), sequence),
                 ]
             }
-            CurrentBlock::Reasoning { index, id } => {
+            CurrentBlock::Reasoning { index, id, signature } => {
+                if !signature.is_empty() {
+                    if let Some(item) = self.output.get_mut(index) {
+                        item["encrypted_content"] = json!(signature);
+                    }
+                }
                 let item = self.output.get(index).cloned().unwrap_or(json!({}));
                 let text = item
                     .pointer("/summary/0/text")
@@ -1127,13 +1328,63 @@ mod tests {
         });
         let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-v4-flash", 32000);
         assert_eq!(outgoing["model"], "monkeycode-basic/deepseek-v4-flash");
-        assert_eq!(outgoing["system"], "be brief");
+        assert_eq!(outgoing["system"][0]["type"], "text");
+        assert_eq!(outgoing["system"][0]["text"], "be brief");
+        assert_eq!(outgoing["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(outgoing["max_tokens"], 128);
         assert_eq!(outgoing["messages"][0]["role"], "user");
         assert_eq!(outgoing["messages"][1]["role"], "assistant");
         assert_eq!(outgoing["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(outgoing["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(outgoing["messages"][2]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(outgoing["tools"][0]["name"], "bash");
+        assert_eq!(outgoing["tools"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn reasoning_round_trips_into_thinking_before_tool_use() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "need bash"}],
+                    "encrypted_content": "sig_abc"
+                },
+                {"type": "function_call", "call_id": "call_1", "name": "bash", "arguments": "{\"command\":\"ls\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
+            ],
+            "reasoning": {"effort": "high"}
+        });
+        let outgoing = to_anthropic_request_with(&body, "monkeycode-basic/deepseek-flash", 32000, Some("low"));
+        let assistant = &outgoing["messages"][1]["content"];
+        assert_eq!(assistant[0]["type"], "thinking");
+        assert_eq!(assistant[0]["thinking"], "need bash");
+        assert_eq!(assistant[0]["signature"], "sig_abc");
+        assert_eq!(assistant[1]["type"], "tool_use");
+        assert_eq!(outgoing["thinking"]["budget_tokens"], 1024);
+        assert!(assistant[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn client_none_disables_thinking_even_when_model_has_effort() {
+        let body = json!({
+            "input": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "none"}
+        });
+        let outgoing = to_anthropic_request_with(&body, "monkeycode-basic/deepseek-flash", 32000, Some("low"));
+        assert!(outgoing.get("thinking").is_none());
+    }
+
+    #[test]
+    fn model_thinking_disabled_drops_client_high() {
+        let body = json!({
+            "input": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "high"}
+        });
+        let outgoing = to_anthropic_request_with(&body, "monkeycode-basic/deepseek-flash", 32000, Some(""));
+        assert!(outgoing.get("thinking").is_none());
     }
 
     #[test]
@@ -1166,6 +1417,28 @@ mod tests {
         assert_eq!(response["output"][0]["type"], "reasoning");
         assert_eq!(response["output"][1]["type"], "message");
         assert_eq!(response["usage"]["input_tokens"], 10);
+    }
+
+    #[test]
+    fn thinking_signature_survives_responses_json() {
+        let data = json!({
+            "id": "msg_1",
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig_xyz"},
+                {"type": "text", "text": "OK"}
+            ]
+        });
+        let response = to_responses_json(&data, "monkeycode-basic/deepseek-flash");
+        assert_eq!(response["output"][0]["encrypted_content"], "sig_xyz");
+        assert_eq!(response["output"][0]["summary"][0]["text"], "plan");
+        let round_trip = to_anthropic_request(
+            &json!({"input": [{"role": "user", "content": "hi"}, response["output"][0].clone()]}),
+            "monkeycode-basic/deepseek-flash",
+            16,
+        );
+        assert_eq!(round_trip["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(round_trip["messages"][1]["content"][0]["signature"], "sig_xyz");
     }
 
     #[test]
@@ -1215,6 +1488,21 @@ mod tests {
         assert_eq!(response["usage"]["input_tokens"], 226);
         assert_eq!(response["usage"]["output_tokens"], 1519);
         assert_eq!(response["output_text"], "");
+    }
+
+    #[test]
+    fn stream_thinking_signature_is_preserved() {
+        let events = vec![
+            json!({"type": "message_start", "message": {"id": "msg_sig"}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "plan"}}),
+            json!({"type": "content_block_delta", "delta": {"type": "signature_delta", "signature": "sig_stream"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+        ];
+        let (_outgoing, response) = replay_anthropic_events(&events, "deepseek-flash");
+        assert_eq!(response["output"][0]["type"], "reasoning");
+        assert_eq!(response["output"][0]["encrypted_content"], "sig_stream");
     }
 
     #[test]

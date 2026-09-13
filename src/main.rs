@@ -998,6 +998,7 @@ struct Runtime {
     signing_secret: String,
     anthropic: bool,
     max_output: u64,
+    thinking_effort: Option<String>,
 }
 
 fn same_url(left: &str, right: &str) -> bool {
@@ -1089,7 +1090,23 @@ async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime,
         signing_secret: signing_secret.unwrap(),
         anthropic: anthropic::is_anthropic_type(model_config.get("type").and_then(Value::as_str)),
         max_output: model_config.get("max_output").and_then(Value::as_u64).unwrap_or(32_000),
+        thinking_effort: model_thinking_effort(model_config),
     })
+}
+
+fn model_thinking_effort(model_config: &Value) -> Option<String> {
+    match model_config.get("thinking") {
+        Some(Value::Bool(false)) => Some(String::new()),
+        Some(Value::Bool(true)) => Some("low".into()),
+        Some(Value::String(effort)) => Some(effort.clone()),
+        Some(Value::Object(map)) => {
+            if map.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return Some(String::new());
+            }
+            Some(map.get("effort").and_then(Value::as_str).unwrap_or("low").to_string())
+        }
+        _ => None,
+    }
 }
 
 fn model_limits_path(config: &Config) -> PathBuf {
@@ -1427,7 +1444,7 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
     let requested_model = body.get("model").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or("gpt-6-astra").to_string();
     let runtime = match load_runtime(&state.config, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
     let outgoing = if runtime.anthropic {
-        anthropic::to_anthropic_request(&body, &runtime.model, runtime.max_output)
+        anthropic::to_anthropic_request_with(&body, &runtime.model, runtime.max_output, runtime.thinking_effort.as_deref())
     } else {
         match normalize_chat_request(&body, &runtime.model) { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } }
     };
@@ -1474,7 +1491,7 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     let requested_model = body.get("model").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or("gpt-6-astra").to_string();
     let runtime = match load_runtime(&state.config, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", e.status, started, None).await; return e.into_response(); } };
     let outgoing = if runtime.anthropic {
-        anthropic::to_anthropic_request(&body, &runtime.model, runtime.max_output)
+        anthropic::to_anthropic_request_with(&body, &runtime.model, runtime.max_output, runtime.thinking_effort.as_deref())
     } else {
         normalize_responses_request(&body, &runtime.model, &developer_prompt(&body))
     };
