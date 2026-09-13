@@ -1,24 +1,18 @@
-# v0.1.26 — Codex DeepSeek 报错修复与动态上下文窗口
+# v0.1.27 — DeepSeek 大图卡住与思考回传
 
-## Codex / DeepSeek
+## DeepSeek 读截图卡住
 
-Codex 里 DeepSeek 连续 502/404 的原因：
+Pi 读完 1080×2400 截图后 DeepSeek 会空等约 22 秒：网关把 `function_call_output` 里的 `input_image` data URL 整段 JSON 塞进 Anthropic `tool_result` 文本，超过 MonkeyCode `983616` 字符上限，上游 400。
 
-- 上游把超长上下文收成 SSE `event:error`（`InvalidParameter` / context length），网关却当成 502，Codex 当断流连着重试
-- OhMyAgent 目录刷新后短名 `deepseek-v4-flash` 对不上 MonkeyCode 前缀，本地直接 404
+现在会转成 Anthropic `image` + `base64`；超过 750KB 的图改成短占位，不再把任务卡死。小图会真正送给模型。
 
-现在会抽出真实错误改成 400 / `response.failed`，短名会回退到 OhMyAgent 同名模型并仍走 MonkeyCode 签名代理。tool_result 数组内容和空 user message 也一并修了。
+## 思考签名、档位与提示缓存
 
-## 动态上下文窗口
+随上一笔未发版提交一并发布：
 
-不再给所有模型写死 100 万 token。每个模型的窗口来自：
-
-1. OhMyAgent `settings.json` 里的 `context_window` / `max_output`
-2. 上游 token 上限报错（例如 GLM「maximum context length is 1048576 tokens」）写入 `~/.mk2api/model-limits.json`，下次同步覆盖
-
-会写回 Pi `contextWindow`、Codex `model_context_window` / 目录，并出现在 `/v1/models` 和管理台「模型」页。广告窗口会预留 `max_output`，避免 input+completion 一起超限。
-
-DeepSeek 那种「input length」字符限制不会当成 token 窗口。
+- Anthropic `thinking` + `signature` ↔ Responses `reasoning.encrypted_content`，下一轮插回同条 assistant 的 `tool_use` 之前
+- `cache_control: ephemeral` 打在 system、最后一个 tool、最后一个非 thinking 内容块
+- 思考预算按 OhMyAgent 模型档位封顶（DeepSeek `thinking.effort: low` → 1024），不再盲从客户端 `high`
 
 ## 安装
 
@@ -26,4 +20,4 @@ DeepSeek 那种「input length」字符限制不会当成 token 窗口。
 bash -c "$(curl -fsSL 'https://raw.githubusercontent.com/co0ontty/mk-to-api/main/online/install')"
 ```
 
-管理界面：http://127.0.0.1:8123/admin
+管理界面：http://127.0.0.1:8124/admin

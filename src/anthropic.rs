@@ -55,30 +55,149 @@ fn text_from_content(content: Option<&Value>) -> String {
     }
 }
 
-fn tool_result_text(value: &Value) -> String {
+/// MonkeyCode rejects Anthropic prompts whose serialized input exceeds this.
+/// A 1080x2400 screenshot as base64 is ~2MB and 400s the request for ~22s, hanging Pi.
+const MAX_ANTHROPIC_IMAGE_B64: usize = 750_000;
+
+fn image_omitted_text(bytes: usize) -> String {
+    format!("[image omitted: {bytes} bytes exceeds gateway limit]")
+}
+
+fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.split(';').next().unwrap_or("image/png");
+    if !media_type.starts_with("image/") || data.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
+}
+
+fn image_url_from_map(map: &serde_json::Map<String, Value>) -> Option<&str> {
+    map.get("image_url").and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| value.get("url").and_then(Value::as_str))
+    })
+}
+
+fn image_payload_len(map: &serde_json::Map<String, Value>) -> usize {
+    if let Some(data) = map.get("data").and_then(Value::as_str) {
+        return data.len();
+    }
+    if let Some(url) = image_url_from_map(map) {
+        if let Some((_, data)) = parse_data_url(url) {
+            return data.len();
+        }
+        return url.len();
+    }
+    map.get("source")
+        .and_then(|source| source.get("data"))
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0)
+}
+
+fn looks_like_image(map: &serde_json::Map<String, Value>) -> bool {
+    matches!(
+        map.get("type").and_then(Value::as_str),
+        Some("image") | Some("input_image") | Some("image_url")
+    ) || map.get("image_url").is_some()
+        || map.get("source").is_some()
+        || (map.get("data").is_some()
+            && map
+                .get("mimeType")
+                .or_else(|| map.get("media_type"))
+                .and_then(Value::as_str)
+                .is_some_and(|mime| mime.starts_with("image/")))
+}
+
+fn anthropic_image_block(map: &serde_json::Map<String, Value>) -> Option<Value> {
+    if let Some(source) = map.get("source").cloned() {
+        if source
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|data| data.len() > MAX_ANTHROPIC_IMAGE_B64)
+        {
+            return None;
+        }
+        return Some(json!({"type": "image", "source": source}));
+    }
+    if let Some(url) = image_url_from_map(map) {
+        if let Some((media_type, data)) = parse_data_url(url) {
+            if data.len() > MAX_ANTHROPIC_IMAGE_B64 {
+                return None;
+            }
+            return Some(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data}
+            }));
+        }
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return Some(json!({"type": "image", "source": {"type": "url", "url": url}}));
+        }
+        return None;
+    }
+    if let Some(data) = map.get("data").and_then(Value::as_str) {
+        if data.len() > MAX_ANTHROPIC_IMAGE_B64 {
+            return None;
+        }
+        let mime = map
+            .get("mimeType")
+            .or_else(|| map.get("media_type"))
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        return Some(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime, "data": data}
+        }));
+    }
+    None
+}
+
+fn image_or_placeholder(map: &serde_json::Map<String, Value>) -> Value {
+    anthropic_image_block(map).unwrap_or_else(|| {
+        json!({"type": "text", "text": image_omitted_text(image_payload_len(map))})
+    })
+}
+
+fn push_tool_result_part(blocks: &mut Vec<Value>, value: &Value) {
     match value {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .map(tool_result_text)
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Value::String(text) if !text.is_empty() => {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
+        Value::Array(parts) => {
+            for part in parts {
+                push_tool_result_part(blocks, part);
+            }
+        }
+        Value::Object(map) if looks_like_image(map) => {
+            blocks.push(image_or_placeholder(map));
+        }
         Value::Object(map) => {
             if let Some(text) = map.get("text").or_else(|| map.get("output")).and_then(Value::as_str) {
                 if !text.is_empty() {
-                    return text.to_string();
+                    blocks.push(json!({"type": "text", "text": text}));
+                    return;
                 }
             }
             if let Some(content) = map.get("content") {
-                let nested = tool_result_text(content);
-                if !nested.is_empty() {
-                    return nested;
-                }
+                push_tool_result_part(blocks, content);
             }
-            value.to_string()
         }
-        other => other.to_string(),
+        _ => {}
+    }
+}
+
+fn tool_result_content(value: &Value) -> Value {
+    let mut blocks = Vec::new();
+    push_tool_result_part(&mut blocks, value);
+    if blocks.is_empty() {
+        json!("(no tool output)")
+    } else if blocks.len() == 1 && blocks[0].get("type").and_then(Value::as_str) == Some("text") {
+        blocks[0].get("text").cloned().unwrap_or_else(|| json!(""))
+    } else {
+        Value::Array(blocks)
     }
 }
 
@@ -98,17 +217,8 @@ fn content_blocks(content: Option<&Value>, for_assistant: bool) -> Vec<Value> {
                         } else {
                             Some(json!({"type": "text", "text": text}))
                         }
-                    } else if !for_assistant && kind == "input_image" {
-                        if let Some(url) = map.get("image_url").and_then(Value::as_str) {
-                            Some(json!({"type": "image", "source": {"type": "url", "url": url}}))
-                        } else {
-                            None
-                        }
-                    } else if !for_assistant && kind == "image_url" {
-                        map.get("image_url")
-                            .and_then(|value| value.get("url"))
-                            .and_then(Value::as_str)
-                            .map(|url| json!({"type": "image", "source": {"type": "url", "url": url}}))
+                    } else if !for_assistant && looks_like_image(map) {
+                        Some(image_or_placeholder(map))
                     } else if for_assistant && matches!(kind, "thinking" | "redacted_thinking") {
                         Some(Value::Object(map.clone()))
                     } else if for_assistant && kind == "tool_use" {
@@ -381,8 +491,8 @@ pub fn to_anthropic_request_with(body: &Value, model: &str, default_max_tokens: 
             let output = map
                 .get("output")
                 .or_else(|| map.get("content"))
-                .map(tool_result_text)
-                .unwrap_or_default();
+                .map(tool_result_content)
+                .unwrap_or_else(|| json!(""));
             push_message(
                 &mut messages,
                 "user",
@@ -1676,5 +1786,80 @@ mod tests {
         let (_, response) = replay_anthropic_events(&events, "deepseek-v4-flash");
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["arguments"], "{\"cmd\":\"pwd\"}");
+    }
+
+    #[test]
+    fn tool_image_becomes_anthropic_base64_not_json_dump() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "look"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{\"path\":\"a.png\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "Read image file"},
+                    {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,aaaa"}
+                ]}
+            ]
+        });
+        let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-flash", 32000);
+        let content = &outgoing["messages"][2]["content"][0]["content"];
+        assert!(content.is_array(), "{content}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Read image file");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "aaaa");
+        let serialized = outgoing.to_string();
+        assert!(!serialized.contains("input_image"), "{serialized}");
+        assert!(!serialized.contains("data:image/png;base64"), "{serialized}");
+    }
+
+    #[test]
+    fn oversized_tool_image_is_omitted_instead_of_blowing_limit() {
+        let huge = "a".repeat(800_001);
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "look"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "Read image file [image/png]"},
+                    {"type": "input_image", "image_url": format!("data:image/png;base64,{huge}")}
+                ]}
+            ]
+        });
+        let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-flash", 32000);
+        let serialized = outgoing.to_string();
+        assert!(serialized.len() < 50_000, "serialized {}", serialized.len());
+        assert!(!serialized.contains(&huge));
+        let content = &outgoing["messages"][2]["content"][0]["content"];
+        let texts = if let Some(parts) = content.as_array() {
+            parts
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            content.as_str().unwrap_or("").to_string()
+        };
+        assert!(texts.contains("Read image file"), "{texts}");
+        assert!(texts.contains("image omitted"), "{texts}");
+        assert_eq!(content.as_array().map(|parts| parts.iter().any(|block| block.get("type").and_then(Value::as_str) == Some("image"))).unwrap_or(false), false);
+    }
+
+    #[test]
+    fn user_data_url_image_uses_base64_source() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "what is this"},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64,bbbb"}
+                ]}
+            ]
+        });
+        let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-flash", 32000);
+        assert_eq!(outgoing["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(outgoing["messages"][0]["content"][1]["source"]["type"], "base64");
+        assert_eq!(outgoing["messages"][0]["content"][1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(outgoing["messages"][0]["content"][1]["source"]["data"], "bbbb");
     }
 }
