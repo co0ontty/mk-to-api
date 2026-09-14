@@ -58,6 +58,10 @@ fn text_from_content(content: Option<&Value>) -> String {
 /// MonkeyCode rejects Anthropic prompts whose serialized input exceeds this.
 /// A 1080x2400 screenshot as base64 is ~2MB and 400s the request for ~22s, hanging Pi.
 const MAX_ANTHROPIC_IMAGE_B64: usize = 750_000;
+/// Stay under MonkeyCode's 983616-char Anthropic input cap with a little headroom.
+const MAX_ANTHROPIC_REQUEST_CHARS: usize = 980_000;
+/// OpenAI-compatible models accept more, but multi-MB screenshot history stalls the stream.
+pub const MAX_OPENAI_REQUEST_CHARS: usize = 2_000_000;
 
 fn image_omitted_text(bytes: usize) -> String {
     format!("[image omitted: {bytes} bytes exceeds gateway limit]")
@@ -159,6 +163,58 @@ fn image_or_placeholder(map: &serde_json::Map<String, Value>) -> Value {
     anthropic_image_block(map).unwrap_or_else(|| {
         json!({"type": "text", "text": image_omitted_text(image_payload_len(map))})
     })
+}
+
+fn image_placeholder_block(map: &serde_json::Map<String, Value>) -> Value {
+    let kind = if map.get("type").and_then(Value::as_str) == Some("input_image") {
+        "input_text"
+    } else {
+        "text"
+    };
+    json!({"type": kind, "text": image_omitted_text(image_payload_len(map))})
+}
+
+fn omit_oldest_image(value: &mut Value) -> bool {
+    let replacement = match value {
+        Value::Object(map) if looks_like_image(map) && image_payload_len(map) > 0 => {
+            Some(image_placeholder_block(map))
+        }
+        _ => None,
+    };
+    if let Some(replaced) = replacement {
+        *value = replaced;
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.iter_mut().any(omit_oldest_image),
+        Value::Object(map) => {
+            for key in ["content", "output", "messages", "input", "parts"] {
+                if let Some(child) = map.get_mut(key) {
+                    if omit_oldest_image(child) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Drop oldest embedded images until the serialized request fits `max_chars`.
+/// Pi keeps every screenshot in history; one 1080x2400 PNG is ~0.5-0.9MB base64,
+/// and a handful of them 400 the Anthropic path for ~22s or stall OpenAI streams.
+pub fn cap_request_images(outgoing: &mut Value, max_chars: usize) {
+    let mut omitted = 0;
+    while outgoing.to_string().len() > max_chars && omitted < 64 {
+        if !omit_oldest_image(outgoing) {
+            break;
+        }
+        omitted += 1;
+    }
+    if omitted > 0 {
+        eprintln!("omitted {omitted} image(s) to fit {max_chars} char upstream limit");
+    }
 }
 
 fn push_tool_result_part(blocks: &mut Vec<Value>, value: &Value) {
@@ -572,6 +628,7 @@ pub fn to_anthropic_request_with(body: &Value, model: &str, default_max_tokens: 
         }
         outgoing["thinking"] = thinking;
     }
+    cap_request_images(&mut outgoing, MAX_ANTHROPIC_REQUEST_CHARS);
     outgoing
 }
 
@@ -1861,5 +1918,69 @@ mod tests {
         assert_eq!(outgoing["messages"][0]["content"][1]["source"]["type"], "base64");
         assert_eq!(outgoing["messages"][0]["content"][1]["source"]["media_type"], "image/jpeg");
         assert_eq!(outgoing["messages"][0]["content"][1]["source"]["data"], "bbbb");
+    }
+
+    #[test]
+    fn pi_native_image_block_becomes_anthropic_base64() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "look"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": [
+                    {"type": "text", "text": "Read image file [image/png]"},
+                    {"type": "image", "data": "aaaa", "mimeType": "image/png"}
+                ]}
+            ]
+        });
+        let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-flash", 32000);
+        let content = &outgoing["messages"][2]["content"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["data"], "aaaa");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+    }
+
+    #[test]
+    fn multiple_medium_images_are_capped_to_anthropic_input_limit() {
+        let shot = |tag: &str| json!({
+            "type": "function_call_output",
+            "call_id": tag,
+            "output": [
+                {"type": "input_text", "text": format!("shot {tag}")},
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{}", tag.repeat(400_000))}
+            ]
+        });
+        let body = json!({
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "look"}]},
+                {"type": "function_call", "call_id": "A", "name": "read", "arguments": "{}"},
+                shot("A"),
+                {"type": "function_call", "call_id": "B", "name": "read", "arguments": "{}"},
+                shot("B"),
+                {"type": "function_call", "call_id": "C", "name": "read", "arguments": "{}"},
+                shot("C")
+            ]
+        });
+        let outgoing = to_anthropic_request(&body, "monkeycode-basic/deepseek-flash", 32000);
+        let serialized = outgoing.to_string();
+        assert!(serialized.len() <= MAX_ANTHROPIC_REQUEST_CHARS, "serialized {}", serialized.len());
+        assert!(!serialized.contains(&"A".repeat(1000)), "oldest screenshot should be dropped");
+        assert!(serialized.contains(&"C".repeat(1000)), "newest screenshot should be kept");
+        assert!(serialized.contains("image omitted"));
+    }
+
+    #[test]
+    fn cap_request_images_keeps_newest() {
+        let mut value = json!({
+            "input": [
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{}", "A".repeat(1000))},
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{}", "B".repeat(1000))}
+            ]
+        });
+        cap_request_images(&mut value, 1800);
+        let serialized = value.to_string();
+        assert!(serialized.len() <= 1800, "serialized {}", serialized.len());
+        assert!(!serialized.contains(&"A".repeat(50)));
+        assert!(serialized.contains(&"B".repeat(50)));
     }
 }

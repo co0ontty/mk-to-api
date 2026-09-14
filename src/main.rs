@@ -901,6 +901,11 @@ fn input_content(content: Option<&Value>, role: &str) -> Value {
             Value::Object(map) if matches!(map.get("type").and_then(Value::as_str), Some("text") | Some("input_text") | Some("output_text")) => Some(json!({"type": text_type, "text": map.get("text").and_then(Value::as_str).unwrap_or("")})),
             Value::Object(map) if role != "assistant" && map.get("type").and_then(Value::as_str) == Some("image_url") => map.get("image_url").and_then(|v| v.get("url")).and_then(Value::as_str).map(|url| json!({"type": "input_image", "image_url": url, "detail": map.get("image_url").and_then(|v| v.get("detail")).and_then(Value::as_str).unwrap_or("auto")})),
             Value::Object(map) if role != "assistant" && map.get("type").and_then(Value::as_str) == Some("input_image") => Some(Value::Object(map.clone())),
+            Value::Object(map) if role != "assistant" && map.get("type").and_then(Value::as_str) == Some("image") => {
+                let data = map.get("data").and_then(Value::as_str)?;
+                let mime = map.get("mimeType").or_else(|| map.get("media_type")).and_then(Value::as_str).unwrap_or("image/png");
+                Some(json!({"type": "input_image", "image_url": format!("data:{mime};base64,{data}"), "detail": "auto"}))
+            }
             _ => None,
         }).collect::<Vec<_>>(),
         _ => Vec::new(),
@@ -952,7 +957,9 @@ fn normalize_chat_request(body: &Value, model: &str) -> Result<Value, GatewayErr
     outgoing.insert("store".into(), body.get("store").cloned().unwrap_or(json!(false)));
     if let Some(value) = body.get("max_completion_tokens").filter(|v| !v.is_null()).or_else(|| body.get("max_tokens").filter(|v| !v.is_null())) { outgoing.insert("max_output_tokens".into(), value.clone()); }
     for field in ["temperature", "top_p", "metadata", "tools", "tool_choice", "parallel_tool_calls", "user"] { if let Some(value) = body.get(field) { outgoing.insert(field.into(), value.clone()); } }
-    Ok(Value::Object(outgoing))
+    let mut outgoing = Value::Object(outgoing);
+    anthropic::cap_request_images(&mut outgoing, anthropic::MAX_OPENAI_REQUEST_CHARS);
+    Ok(outgoing)
 }
 
 fn normalize_responses_request(body: &Value, model: &str, prompt: &str) -> Value {
@@ -967,7 +974,9 @@ fn normalize_responses_request(body: &Value, model: &str, prompt: &str) -> Value
     outgoing.insert("store".into(), body.get("store").cloned().unwrap_or(json!(false)));
     outgoing.remove("messages"); outgoing.remove("system");
     strip_disabled_reasoning(&mut outgoing);
-    Value::Object(outgoing)
+    let mut outgoing = Value::Object(outgoing);
+    anthropic::cap_request_images(&mut outgoing, anthropic::MAX_OPENAI_REQUEST_CHARS);
+    outgoing
 }
 
 /// Pi 在关闭思考时会带 `reasoning.effort = none`。不少上游模型（如 Qwen）拒绝这个取值，
@@ -1928,6 +1937,32 @@ mod tests {
         let outgoing = normalize_responses_request(&body, "monkeycode-basic/qwen3.8-flash", "You are a helpful assistant.");
         assert!(outgoing.get("reasoning").is_none());
         assert!(outgoing.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_drop_old_screenshots_over_budget() {
+        let shot = |tag: &str| json!({
+            "type": "function_call_output",
+            "call_id": tag,
+            "output": [{
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{}", tag.repeat(800_000))
+            }]
+        });
+        let body = json!({
+            "input": [
+                {"role": "user", "content": "look"},
+                shot("A"),
+                shot("B"),
+                shot("C")
+            ]
+        });
+        let outgoing = normalize_responses_request(&body, "monkeycode-ultra/gpt-6-astra", "You are a helpful assistant.");
+        let serialized = outgoing.to_string();
+        assert!(serialized.len() <= anthropic::MAX_OPENAI_REQUEST_CHARS, "serialized {}", serialized.len());
+        assert!(!serialized.contains(&"A".repeat(1000)));
+        assert!(serialized.contains(&"C".repeat(1000)));
+        assert!(serialized.contains("image omitted"));
     }
 
     #[test]
