@@ -64,7 +64,8 @@ Admin Key 位于 `~/.mk2api/admin.key`，用量记录位于 `~/.mk2api/usage.jso
 
 ## 本机 Pi / Codex 托管
 
-服务启动后会检测本机配置并自动改写为只走 mk2api，同时按当前 `/v1/models` 全量更新模型目录：
+服务启动后会检测本机配置并增量写回 mk2api provider，同时按当前 `/v1/models` 更新自己的模型目录。
+已有的其它 provider（`monkeycode`、`OpenAI` 等）和配置文件里的其它字段都会原样保留：
 
 - Pi：`~/.pi/agent/models.json`、`~/.pi/agent/settings.json`
 - Codex：`~/.codex/config.toml`、`~/.codex/codex-models.json`

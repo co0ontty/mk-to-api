@@ -170,7 +170,9 @@ pub fn preferred_default_model(ids: &[String], current: Option<&str>) -> String 
     ids.first().cloned().unwrap_or_else(|| "qwen3.8-flash".to_string())
 }
 
-pub fn pi_models_payload(base_url: &str, api_key: &str, models: &[ModelInfo]) -> Value {
+/// 在已有 models.json 上做增量更新：保留其它 provider、顶层字段，以及用户在
+/// mk2api provider 里自定义的字段，只覆盖我们托管的 baseUrl / api / apiKey / models。
+pub fn pi_models_payload(current: &Value, base_url: &str, api_key: &str, models: &[ModelInfo]) -> Value {
     let ids = model_ids(models);
     let payload_models = ordered_model_ids(&ids)
         .into_iter()
@@ -186,16 +188,26 @@ pub fn pi_models_payload(base_url: &str, api_key: &str, models: &[ModelInfo]) ->
             })
         })
         .collect::<Vec<_>>();
-    json!({
-        "providers": {
-            PROVIDER: {
-                "baseUrl": base_url,
-                "api": "openai-responses",
-                "apiKey": api_key,
-                "models": payload_models
-            }
-        }
-    })
+
+    let mut root = match current {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    let mut providers = match root.remove("providers") {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    let mut provider = match providers.remove(PROVIDER) {
+        Some(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    provider.insert("baseUrl".into(), Value::String(base_url.into()));
+    provider.insert("api".into(), Value::String("openai-responses".into()));
+    provider.insert("apiKey".into(), Value::String(api_key.into()));
+    provider.insert("models".into(), Value::Array(payload_models));
+    providers.insert(PROVIDER.into(), Value::Object(provider));
+    root.insert("providers".into(), Value::Object(providers));
+    Value::Object(root)
 }
 
 pub fn patch_pi_settings(current: Value, default_model: &str) -> Value {
@@ -254,7 +266,11 @@ pub fn extract_codex_key(text: &str) -> Option<String> {
     tables.iter().find_map(|(_, body)| extract_toml_string(body, "experimental_bearer_token"))
 }
 
+/// 在已有 config.toml 上做增量更新：只替换 `[model_providers.mk2api]`（保留表里的
+/// 自定义键），其它 `[model_providers.*]` 和其余表原样保留。
 pub fn patch_codex_toml(current: &str, base_url: &str, api_key: &str, default_model: &str, catalog_path: &str, context_window: u64) -> String {
+    const MANAGED: [&str; 5] = ["name", "base_url", "wire_api", "requires_openai_auth", "experimental_bearer_token"];
+
     let (preamble, tables) = split_toml(current);
     let mut preamble = set_preamble_key(&preamble, "model_provider", &quote(PROVIDER));
     preamble = set_preamble_key(&preamble, "model", &quote(default_model));
@@ -262,21 +278,59 @@ pub fn patch_codex_toml(current: &str, base_url: &str, api_key: &str, default_mo
     preamble = set_preamble_key(&preamble, "model_catalog_json", &quote(catalog_path));
     preamble = set_preamble_key(&preamble, "model_context_window", &context_window.to_string());
 
-    let mut kept = Vec::new();
-    for (name, body) in tables {
-        if name.starts_with("model_providers.") {
-            continue;
-        }
-        kept.push((name, body));
-    }
-    let provider = format!(
+    let managed_body = format!(
         "name = {}\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = false\nexperimental_bearer_token = {}\n",
         quote(PROVIDER),
         quote(base_url),
         quote(api_key)
     );
-    kept.insert(0, ("model_providers.mk2api".into(), provider));
+
+    let mut kept = Vec::new();
+    let mut replaced = false;
+    for (name, body) in tables {
+        if is_provider_table(&name, PROVIDER) {
+            kept.push((name, merge_table_body(&managed_body, &body, &MANAGED)));
+            replaced = true;
+        } else {
+            kept.push((name, body));
+        }
+    }
+    if !replaced {
+        kept.insert(0, (format!("model_providers.{PROVIDER}"), managed_body));
+    }
     join_toml(&preamble, &kept)
+}
+
+fn is_provider_table(name: &str, provider: &str) -> bool {
+    let normalized = name
+        .split('.')
+        .map(|part| part.trim().trim_matches(['"', '\'']))
+        .collect::<Vec<_>>()
+        .join(".");
+    normalized == format!("model_providers.{provider}")
+}
+
+/// 我们托管的键优先；表里其它自定义键（headers 等）保留在原有相对顺序里。
+fn merge_table_body(managed_body: &str, existing: &str, managed_keys: &[&str]) -> String {
+    let mut out = managed_body.to_string();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let ident = trimmed
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(['"', '\'']);
+        if managed_keys.contains(&ident) {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 pub fn codex_catalog(models: &[ModelInfo]) -> Value {
@@ -628,8 +682,8 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[Mo
             message: "catalog empty".into(),
         });
     }
-    let payload = pi_models_payload(base_url, api_key, models);
     let current_models = read_json_or_empty(&paths.pi_models);
+    let payload = pi_models_payload(&current_models, base_url, api_key, models);
     if !same_json(&current_models, &payload) {
         write_pretty_json(&paths.pi_models, &payload)?;
     }
@@ -756,15 +810,36 @@ mod tests {
     }
 
     #[test]
-    fn pi_payload_keeps_only_mk2api() {
-        let payload = pi_models_payload("http://127.0.0.1:8124/v1", "mk_live_test", &[ModelInfo {
+    fn pi_payload_keeps_other_providers() {
+        let current = json!({
+            "keep_top_level": true,
+            "providers": {
+                "monkeycode": {
+                    "baseUrl": "http://127.0.0.1:8123/v1",
+                    "api": "anthropic-messages",
+                    "apiKey": "local-monkeycode",
+                    "models": [{"id": "qwen3.8-flash"}]
+                },
+                "mk2api": {
+                    "apiKey": "mk_live_old",
+                    "headers": {"x-custom": "1"}
+                }
+            }
+        });
+        let payload = pi_models_payload(&current, "http://127.0.0.1:8124/v1", "mk_live_test", &[ModelInfo {
             id: "monkeycode-basic/qwen3.8-flash".into(),
             anthropic: false,
             context_window: 200_000,
             max_output: 32_000,
         }]);
-        assert_eq!(payload["providers"].as_object().unwrap().len(), 1);
+        let providers = payload["providers"].as_object().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers["monkeycode"]["baseUrl"], "http://127.0.0.1:8123/v1");
+        assert_eq!(providers["monkeycode"]["models"][0]["id"], "qwen3.8-flash");
+        assert_eq!(payload["keep_top_level"], true);
         assert_eq!(payload["providers"]["mk2api"]["apiKey"], "mk_live_test");
+        assert_eq!(payload["providers"]["mk2api"]["baseUrl"], "http://127.0.0.1:8124/v1");
+        assert_eq!(payload["providers"]["mk2api"]["headers"]["x-custom"], "1");
         assert_eq!(payload["providers"]["mk2api"]["models"][0]["id"], "monkeycode-basic/qwen3.8-flash");
         assert_eq!(payload["providers"]["mk2api"]["models"][1]["id"], "qwen3.8-flash");
         assert_eq!(payload["providers"]["mk2api"]["models"][0]["contextWindow"], 168_000);
@@ -772,7 +847,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_patch_drops_other_providers() {
+    fn pi_payload_creates_file_when_empty() {
+        let payload = pi_models_payload(&Value::Object(Map::new()), "http://127.0.0.1:8124/v1", "mk_live_test", &[]);
+        assert_eq!(payload["providers"].as_object().unwrap().len(), 1);
+        assert!(payload["providers"]["mk2api"].is_object());
+    }
+
+    #[test]
+    fn codex_patch_keeps_other_providers() {
         let current = r#"model_provider = "MonkeyCode"
 model = "qwen3.8-flash"
 review_model = "qwen3.8-flash"
@@ -782,9 +864,16 @@ name = "MonkeyCode Direct"
 base_url = "http://127.0.0.1:8123/v1"
 experimental_bearer_token = "local-monkeycode-direct"
 
+[model_providers.mk2api]
+name = "mk2api"
+base_url = "http://127.0.0.1:8124/v1"
+experimental_bearer_token = "mk_live_old"
+http_headers = { "x-custom" = "1" }
+
 [model_providers.OpenAI]
 name = "OpenAI"
 base_url = "https://example.invalid"
+experimental_bearer_token = "sk-user-key"
 
 [features]
 goals = true
@@ -801,10 +890,33 @@ goals = true
         assert!(next.contains("model_provider = \"mk2api\""));
         assert!(next.contains("[model_providers.mk2api]"));
         assert!(next.contains("experimental_bearer_token = \"mk_live_test\""));
-        assert!(!next.contains("[model_providers.MonkeyCode]"));
-        assert!(!next.contains("[model_providers.OpenAI]"));
+        assert!(next.contains("[model_providers.MonkeyCode]"));
+        assert!(next.contains("local-monkeycode-direct"));
+        assert!(next.contains("[model_providers.OpenAI]"));
+        assert!(next.contains("https://example.invalid"));
+        assert!(next.contains("sk-user-key"));
+        assert!(next.contains("http_headers = { \"x-custom\" = \"1\" }"));
         assert!(next.contains("[features]"));
+        assert_eq!(next.matches("[model_providers.mk2api]").count(), 1);
         assert_eq!(extract_codex_key(&next).as_deref(), Some("mk_live_test"));
+    }
+
+    #[test]
+    fn codex_patch_adds_provider_once_when_absent() {
+        let current = "model = \"qwen3.8-flash\"\n\n[features]\ngoals = true\n";
+        let once = patch_codex_toml(current, "http://127.0.0.1:8124/v1", "mk_live_test", "qwen3.8-flash", "~/.codex/codex-models.json", 168_000);
+        let twice = patch_codex_toml(&once, "http://127.0.0.1:8124/v1", "mk_live_test", "qwen3.8-flash", "~/.codex/codex-models.json", 168_000);
+        assert_eq!(twice.matches("[model_providers.mk2api]").count(), 1);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn codex_patch_matches_quoted_provider_table() {
+        let current = "[model_providers.\"mk2api\"]\nname = \"old\"\nbase_url = \"http://127.0.0.1:1/v1\"\n";
+        let next = patch_codex_toml(current, "http://127.0.0.1:8124/v1", "mk_live_test", "qwen3.8-flash", "~/.codex/codex-models.json", 168_000);
+        assert!(next.contains("http://127.0.0.1:8124/v1"));
+        assert!(!next.contains("http://127.0.0.1:1/v1"));
+        assert_eq!(next.matches("mk2api\"]").count(), 1);
     }
 
     #[test]
@@ -822,5 +934,75 @@ goals = true
             "monkeycode-basic/deepseek-v4-flash".into(),
         ];
         assert_eq!(preferred_default_model(&ids, None), "monkeycode-basic/qwen3.8-flash");
+    }
+
+    fn scratch_paths(name: &str) -> ClientPaths {
+        let home = std::env::temp_dir().join(format!("mk2api-clients-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        ClientPaths::new(home.clone(), home.join(".mk2api"))
+    }
+
+    #[test]
+    fn apply_pi_keeps_existing_providers_on_disk() {
+        let paths = scratch_paths("pi");
+        std::fs::write(
+            &paths.pi_models,
+            r#"{
+  "providers": {
+    "monkeycode": {
+      "baseUrl": "http://127.0.0.1:8123/v1",
+      "api": "anthropic-messages",
+      "apiKey": "local-monkeycode",
+      "models": [{"id": "qwen3.8-flash"}]
+    }
+  }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(&paths.pi_settings, "{\"theme\":\"dark\"}\n").unwrap();
+        let models = vec![ModelInfo {
+            id: "monkeycode-basic/qwen3.8-flash".into(),
+            anthropic: false,
+            context_window: 200_000,
+            max_output: 32_000,
+        }];
+        let report = apply_pi(&paths, "http://127.0.0.1:8124/v1", "mk_live_test", &models).unwrap();
+        assert!(report.managed);
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&paths.pi_models).unwrap()).unwrap();
+        assert_eq!(written["providers"]["monkeycode"]["baseUrl"], "http://127.0.0.1:8123/v1");
+        assert_eq!(written["providers"]["monkeycode"]["models"][0]["id"], "qwen3.8-flash");
+        assert_eq!(written["providers"]["mk2api"]["apiKey"], "mk_live_test");
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(&paths.pi_settings).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["defaultProvider"], "mk2api");
+        let _ = std::fs::remove_dir_all(&paths.user_home);
+    }
+
+    #[test]
+    fn apply_codex_keeps_existing_providers_on_disk() {
+        let paths = scratch_paths("codex");
+        std::fs::write(
+            &paths.codex_config,
+            "model = \"gpt-5.6-sol\"\n\n[model_providers.OpenAI]\nname = \"OpenAI\"\nbase_url = \"https://example.invalid\"\nexperimental_bearer_token = \"sk-user-key\"\n\n[features]\ngoals = true\n",
+        )
+        .unwrap();
+        let models = vec![ModelInfo {
+            id: "monkeycode-basic/qwen3.8-flash".into(),
+            anthropic: false,
+            context_window: 200_000,
+            max_output: 32_000,
+        }];
+        let report = apply_codex(&paths, "http://127.0.0.1:8124/v1", "mk_live_test", &models).unwrap();
+        assert!(report.managed);
+        let written = std::fs::read_to_string(&paths.codex_config).unwrap();
+        assert!(written.contains("[model_providers.OpenAI]"));
+        assert!(written.contains("sk-user-key"));
+        assert!(written.contains("[model_providers.mk2api]"));
+        assert!(written.contains("[features]"));
+        assert_eq!(written.matches("[model_providers.").count(), 2);
+        let _ = std::fs::remove_dir_all(&paths.user_home);
     }
 }
