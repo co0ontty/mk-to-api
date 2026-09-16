@@ -70,6 +70,11 @@ Admin Key 位于 `~/.mk2api/admin.key`，用量记录位于 `~/.mk2api/usage.jso
 - Pi：`~/.pi/agent/models.json`、`~/.pi/agent/settings.json`
 - Codex：`~/.codex/config.toml`、`~/.codex/codex-models.json`
 
+客户端默认走哪个 provider 也由你决定：只有在没设置过默认、或默认已经指向 `mk2api` 时，
+才会维护 `defaultProvider` / `defaultModel`（Pi）和 `model_provider` / `model` / `review_model` /
+`model_catalog_json` / `model_context_window`（Codex）。一旦你把默认切到别的 provider，
+mk2api 就只保留自己的 provider 表，不再改这些默认值。
+
 之后每 60 秒对照一次目录；模型增减会写回客户端配置。也可手动执行：
 
 ```bash

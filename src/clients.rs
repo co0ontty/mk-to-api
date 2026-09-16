@@ -210,13 +210,28 @@ pub fn pi_models_payload(current: &Value, base_url: &str, api_key: &str, models:
     Value::Object(root)
 }
 
+/// Pi 的默认 provider 是否由我们维护：没设置过（首次接管）或已经指向 mk2api。
+/// 用户主动把 `defaultProvider` 换成别的 provider 后，我们不再抢回来。
+pub fn pi_client_is_ours(settings: &Value) -> bool {
+    match settings.get("defaultProvider").and_then(Value::as_str) {
+        None => true,
+        Some(value) => value.eq_ignore_ascii_case(PROVIDER),
+    }
+}
+
 pub fn patch_pi_settings(current: Value, default_model: &str) -> Value {
     let mut object = match current {
         Value::Object(map) => map,
         _ => Map::new(),
     };
-    object.insert("defaultProvider".into(), Value::String(PROVIDER.into()));
-    object.insert("defaultModel".into(), Value::String(default_model.into()));
+    let ours = match object.get("defaultProvider").and_then(Value::as_str) {
+        None => true,
+        Some(value) => value.eq_ignore_ascii_case(PROVIDER),
+    };
+    if ours {
+        object.insert("defaultProvider".into(), Value::String(PROVIDER.into()));
+        object.insert("defaultModel".into(), Value::String(default_model.into()));
+    }
     Value::Object(object)
 }
 
@@ -266,17 +281,35 @@ pub fn extract_codex_key(text: &str) -> Option<String> {
     tables.iter().find_map(|(_, body)| extract_toml_string(body, "experimental_bearer_token"))
 }
 
-/// 在已有 config.toml 上做增量更新：只替换 `[model_providers.mk2api]`（保留表里的
-/// 自定义键），其它 `[model_providers.*]` 和其余表原样保留。
+/// Codex 的默认 provider 是否由我们维护：没设置过（首次接管）或已经指向 mk2api。
+/// 用户主动把 `model_provider` 换成别的 provider 后，我们不再抢回来，
+/// 否则每 60 秒的同步会把用户刚选好的默认改回 mk2api。
+pub fn codex_client_is_ours(current: &str) -> bool {
+    let (preamble, _) = split_toml(current);
+    match extract_toml_string(&preamble, "model_provider") {
+        None => true,
+        Some(value) => value.eq_ignore_ascii_case(PROVIDER),
+    }
+}
+
+/// 在已有 config.toml 上做增量更新：
+///
+/// - 始终创建/刷新 `[model_providers.mk2api]`（保留表内自定义键），其它表原样保留；
+/// - 只有当客户端默认还没设置、或已经指向 mk2api 时，才维护
+///   `model_provider` / `model` / `review_model` / `model_catalog_json` / `model_context_window`；
+///   用户把默认切到别的 provider 后只补 provider 表，不再动 preamble。
 pub fn patch_codex_toml(current: &str, base_url: &str, api_key: &str, default_model: &str, catalog_path: &str, context_window: u64) -> String {
     const MANAGED: [&str; 5] = ["name", "base_url", "wire_api", "requires_openai_auth", "experimental_bearer_token"];
 
     let (preamble, tables) = split_toml(current);
-    let mut preamble = set_preamble_key(&preamble, "model_provider", &quote(PROVIDER));
-    preamble = set_preamble_key(&preamble, "model", &quote(default_model));
-    preamble = set_preamble_key(&preamble, "review_model", &quote(default_model));
-    preamble = set_preamble_key(&preamble, "model_catalog_json", &quote(catalog_path));
-    preamble = set_preamble_key(&preamble, "model_context_window", &context_window.to_string());
+    let mut preamble = preamble;
+    if codex_client_is_ours(current) {
+        preamble = set_preamble_key(&preamble, "model_provider", &quote(PROVIDER));
+        preamble = set_preamble_key(&preamble, "model", &quote(default_model));
+        preamble = set_preamble_key(&preamble, "review_model", &quote(default_model));
+        preamble = set_preamble_key(&preamble, "model_catalog_json", &quote(catalog_path));
+        preamble = set_preamble_key(&preamble, "model_context_window", &context_window.to_string());
+    }
 
     let managed_body = format!(
         "name = {}\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = false\nexperimental_bearer_token = {}\n",
@@ -688,6 +721,7 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[Mo
         write_pretty_json(&paths.pi_models, &payload)?;
     }
     let current_settings = read_json_or_empty(&paths.pi_settings);
+    let owns_client = pi_client_is_ours(&current_settings);
     let default_model = preferred_default_model(&ids, extract_pi_default_model(&current_settings).as_deref());
     let settings = patch_pi_settings(current_settings.clone(), &default_model);
     if !same_json(&current_settings, &settings) {
@@ -699,7 +733,11 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[Mo
         managed: true,
         path: Some(paths.pi_models.display().to_string()),
         models: ordered_model_ids(&ids).len(),
-        message: format!("default {default_model}"),
+        message: if owns_client {
+            format!("default {default_model}")
+        } else {
+            "provider registered; client default kept".into()
+        },
     })
 }
 
@@ -744,6 +782,7 @@ pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, models: &
         })
         .unwrap_or_else(|| "~/.codex/codex-models.json".to_string());
     let short_ids = unique_short_ids(&ids);
+    let owns_client = codex_client_is_ours(&current);
     let current_model = extract_toml_string(&current, "model");
     let default_model = preferred_default_model(&short_ids, current_model.as_deref());
     let context_window = meta_for(models, &default_model).map(ModelInfo::advertised_context).unwrap_or(DEFAULT_CONTEXT_WINDOW);
@@ -762,7 +801,11 @@ pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, models: &
         managed: true,
         path: Some(paths.codex_config.display().to_string()),
         models: short_ids.len(),
-        message: format!("default {default_model}"),
+        message: if owns_client {
+            format!("default {default_model}")
+        } else {
+            "provider registered; client default kept".into()
+        },
     })
 }
 
@@ -855,7 +898,7 @@ mod tests {
 
     #[test]
     fn codex_patch_keeps_other_providers() {
-        let current = r#"model_provider = "MonkeyCode"
+        let current = r#"model_provider = "mk2api"
 model = "qwen3.8-flash"
 review_model = "qwen3.8-flash"
 
@@ -917,6 +960,87 @@ goals = true
         assert!(next.contains("http://127.0.0.1:8124/v1"));
         assert!(!next.contains("http://127.0.0.1:1/v1"));
         assert_eq!(next.matches("mk2api\"]").count(), 1);
+    }
+
+    #[test]
+    fn codex_patch_keeps_user_default_provider() {
+        // 用户把 Codex 默认切到自己的 provider：只补 mk2api 表，不动 preamble。
+        let current = r#"model_provider = "OpenAI"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
+network_access = "enabled"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://example.invalid"
+experimental_bearer_token = "sk-user-key"
+
+[features]
+goals = true
+"#;
+        let next = patch_codex_toml(
+            current,
+            "http://127.0.0.1:8124/v1",
+            "mk_live_test",
+            "deepseek-flash",
+            "~/.codex/codex-models.json",
+            168_000,
+        );
+        assert!(next.contains("model_provider = \"OpenAI\""));
+        assert!(!next.contains("model_provider = \"mk2api\""));
+        assert!(next.contains("model = \"gpt-5.5\""));
+        assert!(next.contains("review_model = \"gpt-5.5\""));
+        assert!(!next.contains("model_context_window"));
+        assert!(!next.contains("model_catalog_json"));
+        assert!(next.contains("[model_providers.mk2api]"));
+        assert!(next.contains("experimental_bearer_token = \"mk_live_test\""));
+        assert!(next.contains("[model_providers.OpenAI]"));
+        assert!(next.contains("sk-user-key"));
+        // 幂等：再来一轮不应该又生成新内容
+        let again = patch_codex_toml(&next, "http://127.0.0.1:8124/v1", "mk_live_test", "deepseek-flash", "~/.codex/codex-models.json", 168_000);
+        assert_eq!(next, again);
+    }
+
+    #[test]
+    fn codex_patch_takes_over_when_provider_unset() {
+        let current = "model = \"gpt-5.6-sol\"\n\n[features]\ngoals = true\n";
+        let next = patch_codex_toml(
+            current,
+            "http://127.0.0.1:8124/v1",
+            "mk_live_test",
+            "qwen3.8-flash",
+            "~/.codex/codex-models.json",
+            168_000,
+        );
+        assert!(next.contains("model_provider = \"mk2api\""));
+        assert!(next.contains("model = \"qwen3.8-flash\""));
+        assert!(next.contains("model_context_window = 168000"));
+        assert!(codex_client_is_ours(&next));
+    }
+
+    #[test]
+    fn codex_client_ownership_detection() {
+        assert!(codex_client_is_ours("model = \"x\"\n"));
+        assert!(codex_client_is_ours("model_provider = \"mk2api\"\n"));
+        assert!(!codex_client_is_ours("model_provider = \"OpenAI\"\n"));
+        assert!(!codex_client_is_ours("model_provider = \"MonkeyCode\"\n"));
+    }
+
+    #[test]
+    fn pi_settings_keeps_user_default_provider() {
+        let current = json!({"theme": "dark", "defaultProvider": "anthropic", "defaultModel": "claude-x"});
+        let patched = patch_pi_settings(current.clone(), "qwen3.8-flash");
+        assert_eq!(patched, current);
+        assert!(!pi_client_is_ours(&current));
+    }
+
+    #[test]
+    fn pi_settings_takes_over_when_provider_unset() {
+        let patched = patch_pi_settings(json!({"theme": "dark"}), "qwen3.8-flash");
+        assert_eq!(patched["theme"], "dark");
+        assert_eq!(patched["defaultProvider"], "mk2api");
+        assert_eq!(patched["defaultModel"], "qwen3.8-flash");
+        assert!(pi_client_is_ours(&patched));
     }
 
     #[test]
