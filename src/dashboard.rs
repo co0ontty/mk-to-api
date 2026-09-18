@@ -204,6 +204,8 @@ pub fn stats(store: &UsageStore, keys: &ApiKeyStore, config: &Config, started_at
                 "trust_proxy": config.trust_proxy,
                 "allowed_ips": config.allowed_ips,
                 "manage_clients": config.manage_clients,
+                "manage_pi": config.manage_pi,
+                "manage_codex": config.manage_codex,
                 "started_at": started_at,
                 "usage_records": store.records.len(),
                 "max_usage_records": store.max_records,
@@ -326,6 +328,7 @@ mod tests {
             api_keys_path: std::env::temp_dir().join("mk2api-test-api-keys.json"),
             usage_path: std::env::temp_dir().join("mk2api-test-usage.json"),
             admin_key_path: std::env::temp_dir().join("mk2api-test-admin.key"),
+            config_path: std::env::temp_dir().join("mk2api-test-config.json"),
             admin_key: None,
             max_body_bytes: 1024,
             max_usage_records: 100,
@@ -344,6 +347,8 @@ mod tests {
         assert_eq!(value["window_seconds"], 86_400);
         assert_eq!(value["keys"][0]["name"], "pi");
         assert_eq!(value["system"]["listen"], "0.0.0.0:8123");
+        assert_eq!(value["system"]["manage_pi"], true);
+        assert_eq!(value["system"]["manage_codex"], true);
         assert_eq!(value["series"].as_array().unwrap().len(), 24);
     }
 
@@ -368,6 +373,7 @@ mod tests {
             api_keys_path: std::env::temp_dir().join("mk2api-test-api-keys.json"),
             usage_path: std::env::temp_dir().join("mk2api-test-usage.json"),
             admin_key_path: std::env::temp_dir().join("mk2api-test-admin.key"),
+            config_path: std::env::temp_dir().join("mk2api-test-config.json"),
             admin_key: None,
             max_body_bytes: 1024,
             max_usage_records: 100,
@@ -381,6 +387,7 @@ mod tests {
         };
         config.auth_required = true;
         let value = stats(&store, &keys, &config, now_ts, 0, "http://127.0.0.1:8123/v1");
+        assert_eq!(value["system"]["manage_clients"], false);
         assert_eq!(value["window_seconds"], 0);
         let span = value["span_seconds"].as_u64().unwrap();
         assert!(span >= 7_200, "span should cover the oldest record, got {span}");

@@ -50,6 +50,7 @@ struct Config {
     api_keys_path: PathBuf,
     usage_path: PathBuf,
     admin_key_path: PathBuf,
+    config_path: PathBuf,
     admin_key: Option<String>,
     max_body_bytes: usize,
     max_usage_records: usize,
@@ -62,12 +63,44 @@ struct Config {
     manage_codex: bool,
 }
 
+/// 系统配置同步托管开关：总开关 + 各 CLI 独立开关。
+/// 运行时可在管理台改，并写回 config.json；总开关关闭时不改写任何客户端配置。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClientManage {
+    enabled: bool,
+    pi: bool,
+    codex: bool,
+}
+
+impl ClientManage {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            enabled: config.manage_clients,
+            pi: config.manage_pi,
+            codex: config.manage_codex,
+        }
+    }
+
+    fn apply_patch(&mut self, body: &Value) {
+        if let Some(value) = body.get("manage_clients").or_else(|| body.get("enabled")).and_then(Value::as_bool) {
+            self.enabled = value;
+        }
+        if let Some(value) = body.get("manage_pi").and_then(Value::as_bool) {
+            self.pi = value;
+        }
+        if let Some(value) = body.get("manage_codex").and_then(Value::as_bool) {
+            self.codex = value;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     client: reqwest::Client,
     // 管理台密钥可在线修改，用标准库 RwLock（只在极短临界区加锁，不跨 await）。
     admin_key: Arc<std::sync::RwLock<String>>,
+    client_manage: Arc<std::sync::RwLock<ClientManage>>,
     api_keys: Arc<Mutex<ApiKeyStore>>,
     usage: Arc<Mutex<UsageStore>>,
     started_at: u64,
@@ -263,6 +296,7 @@ impl Config {
             api_keys_path,
             usage_path,
             admin_key_path,
+            config_path,
             admin_key: configured_optional(args, &file, "admin-key", "DIRECT_GATEWAY_ADMIN_KEY"),
             max_body_bytes,
             max_usage_records,
@@ -283,6 +317,29 @@ fn hash_key(value: &str) -> String {
 
 fn new_api_key() -> String {
     format!("mk_live_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn client_manage_of(state: &AppState) -> ClientManage {
+    *state.client_manage.read().expect("client manage lock")
+}
+
+fn merge_client_manage(value: Value, manage: ClientManage) -> Value {
+    let mut value = if value.is_object() { value } else { json!({}) };
+    if let Some(map) = value.as_object_mut() {
+        map.insert("manage_clients".into(), json!(manage.enabled));
+        map.insert("manage_pi".into(), json!(manage.pi));
+        map.insert("manage_codex".into(), json!(manage.codex));
+    }
+    value
+}
+
+async fn persist_client_manage(path: &Path, manage: ClientManage) -> Result<(), BoxError> {
+    let current = match tokio::fs::read_to_string(path).await {
+        Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(boxed(format!("cannot read gateway config: {} ({error})", path.display()))),
+    };
+    write_private(path, &serde_json::to_string_pretty(&merge_client_manage(current, manage))?).await
 }
 
 async fn write_private(path: &Path, contents: &str) -> Result<(), BoxError> {
@@ -1601,12 +1658,18 @@ async fn handle_admin_stats(request: Request<Body>, state: AppState) -> Response
     let params = query_params(request.uri());
     let window = params.get("window").and_then(|value| value.parse::<u64>().ok()).unwrap_or(86_400);
     let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
-    let summary = {
+    let mut summary = {
         // 统计与 Key 列表在同一个锁粒度下读取，避免两次加锁之间 Key 被撤销导致名称对不上。
         let usage = state.usage.lock().await;
         let keys = state.api_keys.lock().await;
         dashboard::stats(&usage, &keys, &state.config, state.started_at, window, &base_url)
     };
+    if let Some(map) = summary.get_mut("system").and_then(Value::as_object_mut) {
+        let manage = client_manage_of(&state);
+        map.insert("manage_clients".into(), json!(manage.enabled));
+        map.insert("manage_pi".into(), json!(manage.pi));
+        map.insert("manage_codex".into(), json!(manage.codex));
+    }
     json_response(&request, &state.config, StatusCode::OK, summary)
 }
 
@@ -1663,7 +1726,7 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
         let allow_headers = if requested.trim().is_empty() { HeaderValue::from_static("Authorization, Content-Type, x-api-key, x-goog-api-key, anthropic-version") } else { HeaderValue::from_str(&requested).unwrap_or_else(|_| HeaderValue::from_static("Authorization, Content-Type, x-api-key, x-goog-api-key, anthropic-version")) };
         let mut response = StatusCode::NO_CONTENT.into_response();
         response.headers_mut().extend(cors_headers(&request, &state.config));
-        response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+        response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PATCH, DELETE, OPTIONS"));
         response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
         response.headers_mut().insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
         return response;
@@ -1684,6 +1747,7 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     if path == "/v1/admin/models" && request.method() == axum::http::Method::GET { return handle_admin_models(request, state).await; }
     if path == "/v1/admin/logs" && request.method() == axum::http::Method::GET { return handle_admin_logs(request, state).await; }
     if path == "/v1/admin/usage" && request.method() == axum::http::Method::GET { return handle_admin_usage(request, state).await; }
+    if path == "/v1/admin/clients" && request.method() == axum::http::Method::PATCH { return handle_admin_clients_settings(request, state).await; }
     if (path == "/v1/admin/clients" || path == "/v1/admin/clients/sync") && matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::POST) { return handle_admin_clients(request, state).await; }
     if path == "/v1/admin/keys" {
         if request.method() == axum::http::Method::GET { return handle_admin_keys(request, state, None, "list").await; }
@@ -1782,10 +1846,13 @@ async fn ensure_named_key(state: &AppState, name: &str, preferred: Option<String
 
 async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientReport>, BoxError> {
     let paths = clients::ClientPaths::new(user_home(), mk2api_home(&state.config));
-    if !state.config.manage_clients {
+    let manage = client_manage_of(state);
+    if !manage.enabled {
+        let pi_detected = paths.pi_detected();
+        let codex_detected = paths.codex_detected();
         return Ok(vec![
-            clients::skipped("pi", paths.pi_models, "disabled"),
-            clients::skipped("codex", paths.codex_config, "disabled"),
+            clients::skipped("pi", paths.pi_models, pi_detected, "disabled"),
+            clients::skipped("codex", paths.codex_config, codex_detected, "disabled"),
         ]);
     }
     let models = match configured_model_infos(&state.config).await {
@@ -1798,24 +1865,32 @@ async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientRep
     let mut store = clients::load_store(&paths.store_path);
     let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
     let mut reports = Vec::new();
-    if state.config.manage_pi {
+    if manage.pi {
         let preferred = store.pi.as_ref().map(|key| key.raw.clone()).or_else(|| clients::extract_pi_key(&clients::read_json_or_empty(&paths.pi_models)));
         let key = ensure_named_key(state, "pi", preferred).await?;
         store.pi = Some(key.clone());
         reports.push(clients::apply_pi(&paths, &base_url, &key.raw, &models)?);
     } else {
-        reports.push(clients::skipped("pi", paths.pi_models.clone(), "disabled"));
+        reports.push(clients::skipped("pi", paths.pi_models.clone(), paths.pi_detected(), "disabled"));
     }
-    if state.config.manage_codex {
+    if manage.codex {
         let preferred = store.codex.as_ref().map(|key| key.raw.clone()).or_else(|| std::fs::read_to_string(&paths.codex_config).ok().and_then(|text| clients::extract_codex_key(&text)));
         let key = ensure_named_key(state, "codex", preferred).await?;
         store.codex = Some(key.clone());
         reports.push(clients::apply_codex(&paths, &base_url, &key.raw, &models)?);
     } else {
-        reports.push(clients::skipped("codex", paths.codex_config.clone(), "disabled"));
+        reports.push(clients::skipped("codex", paths.codex_config.clone(), paths.codex_detected(), "disabled"));
     }
     clients::write_pretty_json(&paths.store_path, &clients::store_value(&store))?;
     Ok(reports)
+}
+
+async fn clients_payload(state: &AppState) -> Result<Value, BoxError> {
+    let reports = sync_managed_clients(state).await?;
+    let ids = configured_model_ids(&state.config).await.unwrap_or_else(|_| Vec::new());
+    let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
+    let manage = client_manage_of(state);
+    Ok(clients::report_json(&reports, manage.enabled, manage.pi, manage.codex, &base_url, ids.len()))
 }
 
 async fn client_sync_loop(state: AppState) {
@@ -1845,13 +1920,42 @@ async fn handle_admin_clients(request: Request<Body>, state: AppState) -> Respon
     if !admin_authorized(&request, &state) {
         return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
     }
-    let reports = match sync_managed_clients(&state).await {
-        Ok(reports) => reports,
-        Err(error) => return error_response(&request, &state.config, GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error}")).with_type("api_error")),
+    match clients_payload(&state).await {
+        Ok(value) => json_response(&request, &state.config, StatusCode::OK, value),
+        Err(error) => error_response(&request, &state.config, GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error}")).with_type("api_error")),
+    }
+}
+
+/// 修改托管开关：`PATCH /v1/admin/clients {"manage_clients":true,"manage_pi":false,"manage_codex":true}`。
+/// 只提交要改的字段；写回 config.json 后立刻按新开关同步一次。
+async fn handle_admin_clients_settings(request: Request<Body>, state: AppState) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    let body = match read_json(request, state.config.max_body_bytes).await {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
     };
-    let ids = configured_model_ids(&state.config).await.unwrap_or_else(|_| Vec::new());
-    let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
-    json_response(&request, &state.config, StatusCode::OK, clients::report_json(&reports, state.config.manage_clients, &base_url, ids.len()))
+    let has_patch = ["manage_clients", "enabled", "manage_pi", "manage_codex"].iter().any(|key| body.get(*key).and_then(Value::as_bool).is_some());
+    if !has_patch {
+        return GatewayError::new(StatusCode::BAD_REQUEST, "expected manage_clients, manage_pi, or manage_codex").with_type("invalid_request_error").into_response();
+    }
+    let previous = client_manage_of(&state);
+    let manage = {
+        let mut guard = state.client_manage.write().expect("client manage lock");
+        guard.apply_patch(&body);
+        *guard
+    };
+    if manage != previous {
+        if let Err(error) = persist_client_manage(&state.config.config_path, manage).await {
+            *state.client_manage.write().expect("client manage lock") = previous;
+            return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save gateway config: {error}")).with_type("api_error").into_response();
+        }
+    }
+    match clients_payload(&state).await {
+        Ok(value) => json_response(&Request::new(Body::empty()), &state.config, StatusCode::OK, value),
+        Err(error) => error_response(&Request::new(Body::empty()), &state.config, GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error}")).with_type("api_error")),
+    }
 }
 
 async fn run_server(args: &[String]) -> Result<(), BoxError> {
@@ -1864,10 +1968,16 @@ async fn run_server(args: &[String]) -> Result<(), BoxError> {
     let api_keys = ApiKeyStore::load(config.api_keys_path.clone()).await?;
     let usage = UsageStore::load(config.usage_path.clone(), config.max_usage_records).await?;
     let started_at = now();
-    let state = AppState { config: config.clone(), client, admin_key: Arc::new(std::sync::RwLock::new(admin_key)), api_keys: Arc::new(Mutex::new(api_keys)), usage: Arc::new(Mutex::new(usage)), started_at };
-    if config.manage_clients {
-        tokio::spawn(client_sync_loop(state.clone()));
-    }
+    let state = AppState {
+        config: config.clone(),
+        client,
+        admin_key: Arc::new(std::sync::RwLock::new(admin_key)),
+        client_manage: Arc::new(std::sync::RwLock::new(ClientManage::from_config(&config))),
+        api_keys: Arc::new(Mutex::new(api_keys)),
+        usage: Arc::new(Mutex::new(usage)),
+        started_at,
+    };
+    tokio::spawn(client_sync_loop(state.clone()));
     let state_for_fallback = state.clone();
     let fallback = tower::service_fn(move |request: Request<Body>| {
         let state = state_for_fallback.clone();
@@ -2068,5 +2178,28 @@ mod tests {
     #[test]
     fn parse_context_limit_ignores_character_input_length() {
         assert_eq!(parse_context_limit("Range of input length should be [1, 983616]"), None);
+    }
+
+    #[test]
+    fn merge_client_manage_preserves_other_keys() {
+        let value = json!({"host": "0.0.0.0", "port": 8123, "manage_clients": true});
+        let merged = merge_client_manage(value, ClientManage { enabled: false, pi: true, codex: false });
+        assert_eq!(merged["host"], "0.0.0.0");
+        assert_eq!(merged["port"], 8123);
+        assert_eq!(merged["manage_clients"], false);
+        assert_eq!(merged["manage_pi"], true);
+        assert_eq!(merged["manage_codex"], false);
+    }
+
+    #[test]
+    fn client_manage_patch_accepts_enabled_alias() {
+        let mut manage = ClientManage { enabled: true, pi: true, codex: true };
+        manage.apply_patch(&json!({"enabled": false, "manage_pi": false}));
+        assert!(!manage.enabled);
+        assert!(!manage.pi);
+        assert!(manage.codex);
+        manage.apply_patch(&json!({"manage_clients": true, "manage_codex": false}));
+        assert!(manage.enabled);
+        assert!(!manage.codex);
     }
 }

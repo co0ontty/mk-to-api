@@ -233,14 +233,25 @@ fn setup(force_prompt: bool) -> Result<MkConfig, BoxError> {
 
 fn save_config(config: &MkConfig) -> Result<(), BoxError> {
     let path = config_path()?;
-    let value = json!({
-        "host": config.host,
-        "port": config.port,
-        "auth_required": config.auth_required,
-        "api_keys_file": home_dir().join("api-keys.json").to_string_lossy(),
-        "usage_file": home_dir().join("usage.json").to_string_lossy(),
-        "admin_key_file": admin_key_path().to_string_lossy(),
-    });
+    let mut value = if path.exists() {
+        serde_json::from_str::<Value>(&fs::read_to_string(&path).unwrap_or_default()).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !value.is_object() {
+        value = json!({});
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.insert("host".into(), json!(config.host));
+        map.insert("port".into(), json!(config.port));
+        map.insert("auth_required".into(), json!(config.auth_required));
+        map.entry("api_keys_file".to_string()).or_insert_with(|| json!(home_dir().join("api-keys.json").to_string_lossy()));
+        map.entry("usage_file".to_string()).or_insert_with(|| json!(home_dir().join("usage.json").to_string_lossy()));
+        map.entry("admin_key_file".to_string()).or_insert_with(|| json!(admin_key_path().to_string_lossy()));
+        map.entry("manage_clients".to_string()).or_insert(json!(true));
+        map.entry("manage_pi".to_string()).or_insert(json!(true));
+        map.entry("manage_codex".to_string()).or_insert(json!(true));
+    }
     write_private(&path, &serde_json::to_string_pretty(&value)?)?;
     write_private(&port_path(), &format!("{}\n", config.port))?;
     Ok(())
@@ -595,9 +606,11 @@ async fn clients_command(args: &[String]) -> Result<(), BoxError> {
         data.get("base_url").and_then(Value::as_str).unwrap_or("-")
     );
     println!(
-        "catalog {:>5} models   manage_clients={}",
+        "catalog {:>5} models   manage_clients={}  pi={}  codex={}",
         data.get("catalog").and_then(Value::as_u64).unwrap_or(0),
-        data.get("enabled").and_then(Value::as_bool).unwrap_or(false)
+        data.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        data.get("manage_pi").and_then(Value::as_bool).unwrap_or(false),
+        data.get("manage_codex").and_then(Value::as_bool).unwrap_or(false)
     );
     if let Some(items) = data.get("clients").and_then(Value::as_array) {
         for item in items {

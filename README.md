@@ -82,7 +82,7 @@ mk2api clients
 mk2api clients sync
 ```
 
-关闭托管：
+关闭托管：在管理台「系统信息 → 系统配置同步」关掉总开关，或写入：
 
 ```json
 {
@@ -90,7 +90,7 @@ mk2api clients sync
 }
 ```
 
-只托管其中一个时，可用 `manage_pi` / `manage_codex`。
+Pi / Codex 各有独立开关，总开关关闭后不再改写任何客户端配置。也可在同一页分别切换，或使用 `manage_pi` / `manage_codex`。
 
 ## 网关接口
 

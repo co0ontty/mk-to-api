@@ -675,14 +675,28 @@ pub fn local_base_url(host: &str, port: u16, tls: bool) -> String {
     format!("{scheme}://{host}:{port}/v1")
 }
 
-pub fn report_json(reports: &[ClientReport], enabled: bool, base_url: &str, catalog: usize) -> Value {
+fn client_enabled(name: &str, manage_pi: bool, manage_codex: bool) -> bool {
+    match name {
+        "pi" => manage_pi,
+        "codex" => manage_codex,
+        _ => true,
+    }
+}
+
+/// `enabled` 是总开关；`manage_pi` / `manage_codex` 是各 CLI 自己的开关，互不影响。
+/// 每条 client.enabled 只反映该 CLI 开关，方便前端在总开关关闭时仍显示原先勾选状态。
+pub fn report_json(reports: &[ClientReport], enabled: bool, manage_pi: bool, manage_codex: bool, base_url: &str, catalog: usize) -> Value {
     json!({
         "enabled": enabled,
+        "manage_clients": enabled,
+        "manage_pi": manage_pi,
+        "manage_codex": manage_codex,
         "base_url": base_url,
         "catalog": catalog,
         "clients": reports.iter().map(|report| {
             json!({
                 "name": report.name,
+                "enabled": client_enabled(&report.name, manage_pi, manage_codex),
                 "detected": report.detected,
                 "managed": report.managed,
                 "path": report.path,
@@ -819,10 +833,10 @@ fn expand_home(value: &str, user_home: &Path) -> PathBuf {
     }
 }
 
-pub fn skipped(name: &str, path: PathBuf, reason: &str) -> ClientReport {
+pub fn skipped(name: &str, path: PathBuf, detected: bool, reason: &str) -> ClientReport {
     ClientReport {
         name: name.into(),
-        detected: false,
+        detected,
         managed: false,
         path: Some(path.display().to_string()),
         models: 0,
@@ -1128,5 +1142,18 @@ goals = true
         assert!(written.contains("[features]"));
         assert_eq!(written.matches("[model_providers.").count(), 2);
         let _ = std::fs::remove_dir_all(&paths.user_home);
+    }
+
+    #[test]
+    fn report_json_exposes_per_client_switches() {
+        let reports = vec![skipped("pi", PathBuf::from("/tmp/pi"), true, "disabled")];
+        let value = report_json(&reports, true, false, true, "http://127.0.0.1:8123/v1", 3);
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["manage_clients"], true);
+        assert_eq!(value["manage_pi"], false);
+        assert_eq!(value["manage_codex"], true);
+        assert_eq!(value["clients"][0]["enabled"], false);
+        assert_eq!(value["clients"][0]["detected"], true);
+        assert_eq!(value["catalog"], 3);
     }
 }
