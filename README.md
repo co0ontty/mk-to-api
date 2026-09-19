@@ -92,6 +92,59 @@ mk2api clients sync
 
 Pi / Codex 各有独立开关，总开关关闭后不再改写任何客户端配置。也可在同一页分别切换，或使用 `manage_pi` / `manage_codex`。
 
+## 上游渠道（接别的 API）
+
+除了 MonkeyCode，还能把一个外部 API（自带 `名称` + `Base URL` + `API Key`）作为「渠道」接进来。
+网关按模型 ID 路由：命中渠道的请求直接发往该渠道，其它请求仍走 MonkeyCode。
+
+```bash
+mk2api channels add huniu https://api.huniu.example/v1 sk-xxxx --wire chat
+mk2api channels list
+```
+
+也可以在管理台 **上游渠道** 页填表新增（`GET /dashboard`，`/admin` 也指向同一页面）。
+
+### 模型 ID 与显示名
+
+渠道模型的对外 ID 是 `<渠道 slug>/<上游模型名>`，例如 `huniu/gpt-5.6-sol`；
+写回 pi / codex 的显示名带上渠道前缀，例如 `[huniu] GPT-5.6 Sol`，
+这样不同渠道的同名模型在客户端里可以直接区分。渠道模型不额外生成短名别名，避免不同渠道撞名。
+
+slug 由渠道名生成（非 ASCII 名回退为 `channel`），`monkeycode-basic` / `monkeycode-pro` / `monkeycode-ultra` 是保留 slug。
+
+### 上游协议（wire）
+
+| wire | 含义 |
+| --- | --- |
+| `responses`（默认） | 上游就是 OpenAI Responses，网关原样转发（回包里的 `model` 也是上游自己的名字） |
+| `chat` | 上游是 OpenAI Chat Completions，网关双向转换，包括 SSE 流式（含工具调用）与 usage 换算 |
+| `anthropic` | 上游是 Anthropic Messages，走既有的 Anthropic 转换 |
+
+### 模型列表
+
+保存渠道时会自动请求 `<Base URL>/models` 拉取模型列表；拉取失败不影响保存，只把错误记在 `last_error` 上，
+管理台显示「拉取失败」、`mk2api channels list` 会打印错误行。也可以手写模型列表（`refresh: false`）：
+
+```json
+{
+  "channels": [
+    {"slug": "huniu", "name": "huniu", "base_url": "https://api.huniu.example/v1", "api_key": "sk-xxxx", "wire_api": "chat", "models": ["gpt-5.6-sol"]}
+  ]
+}
+```
+
+渠道配置在 `~/.mk2api/channels.json`（权限 0600，`api_key` 只落盘、不回显给管理接口），
+可用 `channels-file` 配置项或 `MK2API_CHANNELS_FILE` 环境变量改路径。
+后台每 60 秒检查一次这个文件：手工编辑会被热加载；每 10 轮（约 10 分钟）重新拉一次上游模型列表，
+刷新会以「上游返回的列表」覆盖手写列表。
+
+管理接口（都需要 Admin Key）：
+
+- `GET|POST /v1/admin/channels` — 列表 / 新增（`POST` 支持 `refresh: false` 跳过自动拉取）
+- `POST /v1/admin/channels/refresh-all` — 全部重新拉取
+- `GET|POST|DELETE /v1/admin/channels/<slug>` — 查看 / 修改（`redirect` 可改 slug）/ 删除
+- `POST /v1/admin/channels/<slug>/refresh` — 单个重新拉取
+
 ## 网关接口
 
 - `GET /v1` — 网关状态
@@ -99,7 +152,8 @@ Pi / Codex 各有独立开关，总开关关闭后不再改写任何客户端配
 - `GET /v1/models`
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
-- `GET /admin` — API Key 管理页面
+- `GET /admin`、`GET /dashboard` — 管理台（含 API Key、模型、上游渠道）
 - `GET /v1/admin/usage` — 用量统计（仅 Admin Key）
+- `GET /v1/admin/channels` — 上游渠道管理与刷新（仅 Admin Key）
 
-Pi / Codex 始终用 OpenAI Responses 或 Chat Completions 调用本机网关。上游只走 MonkeyCode OhMyAgent proxy（`oma` key + HMAC 签名）：`type: openai-responses` 的模型 POST `/responses`，`type: anthropic` 的模型（如 DeepSeek V4 Flash）自动改写为 Anthropic Messages 后 POST `/messages`。短模型名优先解析到 `monkeycode-basic/`。
+Pi / Codex 始终用 OpenAI Responses 或 Chat Completions 调用本机网关。上游默认走 MonkeyCode OhMyAgent proxy（`oma` key + HMAC 签名）：`type: openai-responses` 的模型 POST `/responses`，`type: anthropic` 的模型（如 DeepSeek V4 Flash）自动改写为 Anthropic Messages 后 POST `/messages`。短模型名优先解析到 `monkeycode-basic/`。配了上游渠道后，`<渠道 slug>/` 开头的模型先按渠道路由（见上一节）。

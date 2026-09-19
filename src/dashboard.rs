@@ -147,6 +147,9 @@ pub fn models(catalog: &[crate::clients::ModelInfo]) -> Value {
         "data": catalog.iter().map(|model| json!({
             "id": model.id,
             "object": "model",
+            "name": crate::clients::display_name(model),
+            "channel": model.channel,
+            "upstream": model.upstream_model(),
             "anthropic": model.anthropic,
             "context_window": model.advertised_context(),
             "max_output": model.max_output,
@@ -329,6 +332,7 @@ mod tests {
             usage_path: std::env::temp_dir().join("mk2api-test-usage.json"),
             admin_key_path: std::env::temp_dir().join("mk2api-test-admin.key"),
             config_path: std::env::temp_dir().join("mk2api-test-config.json"),
+            channels_path: std::env::temp_dir().join("mk2api-test-channels.json"),
             admin_key: None,
             max_body_bytes: 1024,
             max_usage_records: 100,
@@ -374,6 +378,7 @@ mod tests {
             usage_path: std::env::temp_dir().join("mk2api-test-usage.json"),
             admin_key_path: std::env::temp_dir().join("mk2api-test-admin.key"),
             config_path: std::env::temp_dir().join("mk2api-test-config.json"),
+            channels_path: std::env::temp_dir().join("mk2api-test-channels.json"),
             admin_key: None,
             max_body_bytes: 1024,
             max_usage_records: 100,
@@ -396,17 +401,10 @@ mod tests {
 
     #[test]
     fn models_expose_protocol_type() {
-        let value = models(&[crate::clients::ModelInfo {
-            id: "monkeycode-basic/x".into(),
-            anthropic: false,
-            context_window: 200_000,
-            max_output: 32_000,
-        }, crate::clients::ModelInfo {
-            id: "deepseek-v4-flash".into(),
-            anthropic: true,
-            context_window: 200_000,
-            max_output: 32_000,
-        }]);
+        let value = models(&[
+            crate::clients::ModelInfo::builtin("monkeycode-basic/x", false, 200_000, 32_000),
+            crate::clients::ModelInfo::builtin("deepseek-v4-flash", true, 200_000, 32_000),
+        ]);
         assert_eq!(value["data"][0]["anthropic"], false);
         assert_eq!(value["data"][1]["anthropic"], true);
         assert_eq!(value["data"][0]["context_window"], 168_000);

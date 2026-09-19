@@ -227,6 +227,7 @@ label.field{display:flex;flex-direction:column;gap:8px;font-size:13.5px;color:va
       <button data-view="usage"><i>◫</i>用量分析</button>
       <button data-view="keys"><i>❖</i>API Key</button>
       <button data-view="models"><i>◇</i>模型</button>
+      <button data-view="channels"><i>⇄</i>上游渠道</button>
       <button data-view="logs"><i>≡</i>调用日志</button>
       <button data-view="system"><i>⚙</i>系统信息</button>
     </nav>
@@ -347,7 +348,53 @@ label.field{display:flex;flex-direction:column;gap:8px;font-size:13.5px;color:va
     <section data-view="models" class="hidden">
       <div class="card">
         <div class="card-head"><div><h3>模型目录</h3><div class="hint" id="modelHint">来自 OhMyAgent 上游配置，短名称会自动补齐 monkeycode-basic/ 前缀</div></div></div>
-        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr><th>模型 ID</th><th>类型</th><th class="sortable" data-sort="context_window" style="text-align:right">上下文<span class="arrow">↕</span></th><th class="sortable" data-sort="requests" style="text-align:right">请求数<span class="arrow">↕</span></th><th class="sortable" data-sort="total_tokens" style="text-align:right">Token<span class="arrow">↕</span></th><th class="sortable" data-sort="success_rate" style="text-align:right">成功率<span class="arrow">↕</span></th><th class="sortable" data-sort="avg_latency_ms" style="text-align:right">平均延迟<span class="arrow">↕</span></th></tr></thead><tbody id="modelsBody"></tbody></table></div>
+        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr><th>模型 ID</th><th>渠道</th><th>类型</th><th class="sortable" data-sort="context_window" style="text-align:right">上下文<span class="arrow">↕</span></th><th class="sortable" data-sort="requests" style="text-align:right">请求数<span class="arrow">↕</span></th><th class="sortable" data-sort="total_tokens" style="text-align:right">Token<span class="arrow">↕</span></th><th class="sortable" data-sort="success_rate" style="text-align:right">成功率<span class="arrow">↕</span></th><th class="sortable" data-sort="avg_latency_ms" style="text-align:right">平均延迟<span class="arrow">↕</span></th></tr></thead><tbody id="modelsBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ============ 上游渠道 ============ -->
+    <section data-view="channels" class="hidden">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h3 id="channelFormTitle">新增渠道</h3>
+            <div class="hint">渠道模型对外 ID 为 <span class="mono">&lt;前缀&gt;/&lt;上游模型&gt;</span>，显示名带 <span class="mono">[渠道名]</span> 前缀，便于区分同名模型</div>
+          </div>
+          <button class="btn sm" id="channelReload">重新加载</button>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <label class="field" style="min-width:180px">渠道名（模型名前缀）
+            <input id="chName" placeholder="例如 huniu" autocomplete="off">
+          </label>
+          <label class="field" style="min-width:280px;flex:1">Base URL
+            <input id="chUrl" placeholder="https://api.example.com/v1" autocomplete="off">
+          </label>
+          <label class="field" style="min-width:260px;flex:1">API Key
+            <input id="chKey" placeholder="sk-..." autocomplete="off">
+          </label>
+          <label class="field" style="min-width:170px">上游协议
+            <select id="chWire">
+              <option value="responses">openai-responses</option>
+              <option value="chat">openai-chat（网关自动转换）</option>
+              <option value="anthropic">anthropic-messages</option>
+            </select>
+          </label>
+          <label class="field" style="min-width:130px">上下文窗口
+            <input id="chContext" placeholder="可选，如 200000" autocomplete="off">
+          </label>
+          <label class="field" style="min-width:120px">最大输出
+            <input id="chMaxOutput" placeholder="可选，如 32000" autocomplete="off">
+          </label>
+          <button class="btn primary" id="channelSave">保存并拉取模型</button>
+          <button class="btn" id="channelCancel" style="display:none">取消编辑</button>
+        </div>
+        <div class="hint" id="channelFormHint" style="margin-top:10px">保存后会请求 <span class="mono">&lt;Base URL&gt;/models</span> 自动拉取模型列表，并立刻同步到 pi / codex。编辑时 API Key 留空表示不修改。</div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="card-head"><div><h3>渠道列表</h3><div class="hint" id="channelHint">-</div></div></div>
+        <div class="table-wrap" style="border:none;background:transparent"><table><thead><tr>
+          <th>渠道</th><th>模型前缀</th><th>Base URL</th><th>协议</th><th>Key</th><th style="text-align:right">模型数</th><th>状态</th><th style="text-align:right">操作</th>
+        </tr></thead><tbody id="channelsBody"></tbody></table></div>
       </div>
     </section>
 
@@ -447,6 +494,8 @@ const state = {
   keys: [],
   models: [],
   clients: null,
+  channels: [],
+  channelEdit: '',
   usageSort: { key: 'requests', dir: -1 },
   keySort: { key: 'requests', dir: -1 },
   modelSort: { key: 'requests', dir: -1 },
@@ -812,14 +861,15 @@ function renderModels(){
   $('#modelHint').textContent = `目录共 ${state.models.length} 个模型；已按当前时间窗标注调用情况`;
   $('#modelsBody').innerHTML = items.length ? items.map(model => `
     <tr>
-      <td class="mono"><span class="truncate" title="${esc(model.id)}">${esc(model.id)}</span></td>
+      <td class="mono"><span class="truncate" title="${esc(model.id)}">${esc(model.id)}</span>${model.name ? `<div class="hint">${esc(model.name)}</div>` : ''}</td>
+      <td>${model.channel ? `<span class="pill info" title="${esc(model.upstream || '')}">${esc(model.channel)}</span>` : '<span class="pill mute">内置</span>'}</td>
       <td>${model.anthropic ? '<span class="pill info">anthropic</span>' : '<span class="pill mute">openai-responses</span>'}</td>
       <td class="num">${model.context_window ? num(model.context_window) : '-'}</td>
       <td class="num">${num(model.requests)}</td>
       <td class="num">${num(model.total_tokens)}</td>
       <td class="num">${model.requests ? ratePill(model.success_rate) : '<span class="pill mute">-</span>'}</td>
       <td class="num">${model.requests ? ms(model.avg_latency_ms) : '-'}</td>
-    </tr>`).join('') : '<tr><td colspan="7"><div class="empty">没有读取到模型目录</div></td></tr>';
+    </tr>`).join('') : '<tr><td colspan="8"><div class="empty">没有读取到模型目录</div></td></tr>';
   $$('[data-sort]').forEach(th => {
     if (!th.closest('[data-view="models"]')) return;
     const active = th.dataset.sort === state.modelSort.key;
@@ -832,6 +882,50 @@ function renderModels(){
   const endpoints = (state.stats?.by_endpoint || []).map(item => item.name);
   endpointSelect.innerHTML = '<option value="">全部</option>' + endpoints.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
   endpointSelect.value = endpoints.includes(current) ? current : '';
+}
+const WIRE_LABEL = { responses: 'openai-responses', chat: 'openai-chat', anthropic: 'anthropic-messages' };
+function renderChannels(){
+  const items = state.channels;
+  const total = items.reduce((sum, item) => sum + (item.model_count || 0), 0);
+  $('#channelHint').textContent = items.length ? `共 ${items.length} 个渠道 / ${total} 个模型；模型 ID 前缀即渠道 slug` : '还没有配置上游渠道';
+  $('#channelsBody').innerHTML = items.length ? items.map(item => {
+    const status = !item.enabled
+      ? '<span class="pill mute">已停用</span>'
+      : item.last_error
+        ? `<span class="pill bad" title="${esc(item.last_error)}">拉取失败</span>`
+        : '<span class="pill ok">正常</span>';
+    return `
+    <tr>
+      <td><strong>${esc(item.name)}</strong></td>
+      <td class="mono">${esc(item.slug)}/</td>
+      <td class="mono"><span class="truncate" title="${esc(item.base_url)}">${esc(item.base_url)}</span></td>
+      <td><span class="pill mute">${esc(WIRE_LABEL[item.wire_api] || item.wire_api || '-')}</span></td>
+      <td>${item.has_key ? '<span class="pill ok">已配置</span>' : '<span class="pill warn">缺失</span>'}</td>
+      <td class="num">${num(item.model_count)}</td>
+      <td>${status}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn sm" data-ch-edit="${esc(item.slug)}">编辑</button>
+        <button class="btn sm" data-ch-refresh="${esc(item.slug)}">刷新模型</button>
+        <button class="btn sm" data-ch-toggle="${esc(item.slug)}">${item.enabled ? '停用' : '启用'}</button>
+        <button class="btn sm" data-ch-delete="${esc(item.slug)}">删除</button>
+      </td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="8"><div class="empty">点击上方表单添加第一个渠道</div></td></tr>';
+}
+function fillChannelForm(item){
+  state.channelEdit = item?.slug || '';
+  $('#chName').value = item?.name || '';
+  $('#chUrl').value = item?.base_url || '';
+  $('#chKey').value = '';
+  $('#chWire').value = item?.wire_api || 'responses';
+  $('#chContext').value = item?.context_window || '';
+  $('#chMaxOutput').value = item?.max_output || '';
+  $('#channelFormTitle').textContent = item ? `编辑渠道 ${item.name}` : '新增渠道';
+  $('#channelSave').textContent = item ? '保存修改' : '保存并拉取模型';
+  $('#channelCancel').style.display = item ? '' : 'none';
+  $('#channelFormHint').innerHTML = item
+    ? 'API Key 留空表示沿用现有 Key；保存后会重新拉取模型列表并同步到 pi / codex。'
+    : '保存后会请求 <span class="mono">&lt;Base URL&gt;/models</span> 自动拉取模型列表，并立刻同步到 pi / codex。';
 }
 function renderLogs(){
   const { items, total, offset, limit } = state.logs;
@@ -927,6 +1021,7 @@ function renderAll(){
   renderUsageTable();
   renderKeys();
   renderModels();
+  renderChannels();
   renderLogs();
   renderSystem();
 }
@@ -940,6 +1035,35 @@ async function loadKeys(){
   const data = await api('/v1/admin/keys');
   state.keys = data.data || [];
 }
+async function saveChannel(){
+  const name = $('#chName').value.trim();
+  const url = $('#chUrl').value.trim();
+  if (!name) return toast('请填写渠道名', 'warn');
+  if (!url) return toast('请填写 Base URL', 'warn');
+  const payload = {
+    name,
+    base_url: url,
+    wire_api: $('#chWire').value,
+    refresh: true,
+  };
+  const key = $('#chKey').value.trim();
+  if (key) payload.api_key = key;
+  const context = Number($('#chContext').value.trim());
+  const maxOutput = Number($('#chMaxOutput').value.trim());
+  if (context > 0) payload.context_window = context;
+  if (maxOutput > 0) payload.max_output = maxOutput;
+  const path = state.channelEdit ? '/v1/admin/channels/' + encodeURIComponent(state.channelEdit) : '/v1/admin/channels';
+  try {
+    const data = await api(path, { method: 'POST', body: JSON.stringify(payload) });
+    state.channels = data.data || [];
+    fillChannelForm(null);
+    await loadModels();
+    renderChannels();
+    renderModels();
+    const saved = state.channels.find(item => item.name === name);
+    toast(saved?.last_error ? ('渠道已保存，但拉取模型失败：' + saved.last_error) : ('渠道已保存 · ' + num(saved?.model_count || 0) + ' 个模型'));
+  } catch (error) { toast(error.message, 'bad'); }
+}
 async function loadModels(){
   try {
     const data = await api('/v1/admin/models');
@@ -950,6 +1074,10 @@ async function loadModels(){
     for (const item of state.stats?.by_model || []) seen.set(item.name, { id: item.name, anthropic: /deepseek|claude|anthropic/i.test(item.name) });
     state.models = Array.from(seen.values());
   }
+}
+async function loadChannels(){
+  try { state.channels = (await api('/v1/admin/channels')).data || []; }
+  catch { state.channels = []; }
 }
 async function loadClients(){
   try { state.clients = await api('/v1/admin/clients'); } catch { state.clients = null; }
@@ -1052,7 +1180,7 @@ async function changeAdminKey(value){
 async function refreshAll(silent){
   try {
     await loadStats();
-    await Promise.all([loadKeys(), loadModels(), loadUpdate()]);
+    await Promise.all([loadKeys(), loadModels(), loadChannels(), loadUpdate()]);
     renderAll();
     if (!silent) toast('已刷新 · ' + new Date().toLocaleTimeString());
   } catch (error) {
@@ -1067,6 +1195,7 @@ const VIEWS = {
   usage: ['用量分析', '按模型 / Key / 端点 / 状态码聚合'],
   keys: ['API Key', '签发、轮换与撤销调用凭证'],
   models: ['模型', '上游模型目录与调用表现'],
+  channels: ['上游渠道', '接入任意 OpenAI / Anthropic 兼容上游，模型名带渠道前缀'],
   logs: ['调用日志', '逐条请求明细，支持筛选与分页'],
   system: ['系统信息', '服务状态、系统配置同步与接入方式'],
 };
@@ -1078,6 +1207,7 @@ function switchView(view){
   $('#viewTitle').textContent = title;
   $('#viewSub').textContent = sub;
   if (view === 'logs') loadLogs().catch(error => toast(error.message, 'bad'));
+  if (view === 'channels') loadChannels().then(renderChannels).catch(() => {});
   if (view === 'system') loadClients().then(renderSystem).catch(() => {});
   if (view === 'overview' || view === 'usage') setTimeout(() => renderTrend(state.stats?.series || []), 0);
 }
@@ -1144,6 +1274,58 @@ function bind(){
     } catch (error) { toast(error.message, 'bad'); }
   });
   $('#reloadKeys').addEventListener('click', () => loadKeys().then(renderKeys).catch(error => toast(error.message, 'bad')));
+
+  // 上游渠道
+  $('#channelSave').addEventListener('click', saveChannel);
+  $('#channelCancel').addEventListener('click', () => fillChannelForm(null));
+  $('#channelReload').addEventListener('click', () => loadChannels().then(renderChannels).catch(error => toast(error.message, 'bad')));
+  ['chName', 'chUrl', 'chKey'].forEach(id => $('#' + id).addEventListener('keydown', event => { if (event.key === 'Enter') saveChannel(); }));
+  $('#channelsBody').addEventListener('click', async event => {
+    const edit = event.target.closest('[data-ch-edit]');
+    const refresh = event.target.closest('[data-ch-refresh]');
+    const toggle = event.target.closest('[data-ch-toggle]');
+    const remove = event.target.closest('[data-ch-delete]');
+    try {
+      if (edit) {
+        const item = state.channels.find(channel => channel.slug === edit.dataset.chEdit);
+        if (item) fillChannelForm(item);
+        return;
+      }
+      if (refresh) {
+        const slug = refresh.dataset.chRefresh;
+        toast('正在拉取 ' + slug + ' 的模型列表...');
+        const data = await api('/v1/admin/channels/' + encodeURIComponent(slug) + '/refresh', { method: 'POST' });
+        state.channels = data.data || [];
+        await loadModels();
+        renderChannels();
+        renderModels();
+        toast('模型列表已刷新');
+        return;
+      }
+      if (toggle) {
+        const item = state.channels.find(channel => channel.slug === toggle.dataset.chToggle);
+        if (!item) return;
+        const data = await api('/v1/admin/channels/' + encodeURIComponent(item.slug), { method: 'POST', body: JSON.stringify({ enabled: !item.enabled }) });
+        state.channels = data.data || [];
+        await loadModels();
+        renderChannels();
+        renderModels();
+        toast(item.enabled ? '已停用该渠道' : '已启用该渠道');
+        return;
+      }
+      if (remove) {
+        const slug = remove.dataset.chDelete;
+        if (!confirm('删除渠道「' + slug + '」后，相关模型会从 pi / codex 配置里移除，确认继续？')) return;
+        const data = await api('/v1/admin/channels/' + encodeURIComponent(slug), { method: 'DELETE' });
+        state.channels = data.data || [];
+        if (state.channelEdit === slug) fillChannelForm(null);
+        await loadModels();
+        renderChannels();
+        renderModels();
+        toast('已删除渠道 ' + slug);
+      }
+    } catch (error) { toast(error.message, 'bad'); }
+  });
   $('#keysBody').addEventListener('click', async event => {
     const rotate = event.target.closest('[data-rotate]');
     const revoke = event.target.closest('[data-revoke]');

@@ -11,23 +11,88 @@ const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const DEFAULT_MAX_OUTPUT: u64 = 32_000;
 
 /// 网关目录里的一条模型：id、协议、以及从 OhMyAgent / 上游错误动态得到的窗口。
+///
+/// 渠道模型与内置模型共用一个结构：
+/// - 内置（MonkeyCode）：`id` 就是上游模型名（可带 `monkeycode-*/` 前缀），`channel` 为空；
+/// - 渠道：`id` 是带渠道前缀的对外名（`huniu/gpt-5.6-sol`），`channel` 是渠道显示名，
+///   `upstream` 是真正发给上游的模型名。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
     pub anthropic: bool,
     pub context_window: u64,
     pub max_output: u64,
+    pub channel: Option<String>,
+    pub upstream: Option<String>,
 }
 
 impl ModelInfo {
+    /// MonkeyCode 内置上游模型。
+    pub fn builtin(id: &str, anthropic: bool, context_window: u64, max_output: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            anthropic,
+            context_window,
+            max_output,
+            channel: None,
+            upstream: None,
+        }
+    }
+
+    /// 渠道模型：`id` 为对外 ID，`channel` 为显示名前缀，`upstream` 为上游模型名。
+    pub fn channel(id: &str, channel: &str, upstream: &str, anthropic: bool, context_window: u64, max_output: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            anthropic,
+            context_window,
+            max_output,
+            channel: Some(channel.to_string()),
+            upstream: Some(upstream.to_string()),
+        }
+    }
+
     pub fn advertised_context(&self) -> u64 {
         let reserve = self.max_output.min(self.context_window / 5);
         self.context_window.saturating_sub(reserve).max(16_384)
+    }
+
+    /// 上游真实模型名：渠道模型取 `upstream`，内置模型取 `id`。
+    pub fn upstream_model(&self) -> &str {
+        self.upstream.as_deref().unwrap_or(&self.id)
     }
 }
 
 pub fn model_ids(models: &[ModelInfo]) -> Vec<String> {
     models.iter().map(|model| model.id.clone()).collect()
+}
+
+/// 内置（MonkeyCode）模型 ID。
+fn builtin_ids(models: &[ModelInfo]) -> Vec<String> {
+    models.iter().filter(|model| model.channel.is_none()).map(|model| model.id.clone()).collect()
+}
+
+/// 渠道模型 ID。已经带渠道前缀，不再派生短名别名，避免跨渠道重名。
+fn channel_ids(models: &[ModelInfo]) -> Vec<String> {
+    models.iter().filter(|model| model.channel.is_some()).map(|model| model.id.clone()).collect()
+}
+
+/// Pi 模型列表：内置模型保持「全名 + 短名别名」，渠道模型只列带前缀的对外 ID。
+pub fn pi_model_ids(models: &[ModelInfo]) -> Vec<String> {
+    append_unique(ordered_model_ids(&builtin_ids(models)), channel_ids(models))
+}
+
+/// Codex 目录 slug：内置模型用短名，渠道模型用带前缀的对外 ID。
+pub fn codex_slug_ids(models: &[ModelInfo]) -> Vec<String> {
+    append_unique(unique_short_ids(&builtin_ids(models)), channel_ids(models))
+}
+
+fn append_unique(mut ids: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    for id in extra {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
 }
 
 fn meta_for<'a>(models: &'a [ModelInfo], id: &str) -> Option<&'a ModelInfo> {
@@ -95,12 +160,17 @@ impl ClientPaths {
     }
 }
 
-pub fn display_name(id: &str) -> String {
-    let (tier, short) = split_model_id(id);
+/// 模型显示名。渠道模型带上渠道前缀（`[huniu] GPT-5.6 Sol`），
+/// 内置模型沿用「漂亮名 + (MonkeyCode 档位)」的历史格式。
+pub fn display_name(model: &ModelInfo) -> String {
+    if let Some(channel) = &model.channel {
+        return format!("[{channel}] {}", pretty_short(model.upstream_model()));
+    }
+    let (tier, short) = split_model_id(&model.id);
     let pretty = pretty_short(short);
     match tier {
         Some(tier) => format!("{pretty} (MonkeyCode {tier})"),
-        None if id.contains('/') => pretty,
+        None if model.id.contains('/') => pretty,
         None => format!("{pretty} short"),
     }
 }
@@ -173,14 +243,13 @@ pub fn preferred_default_model(ids: &[String], current: Option<&str>) -> String 
 /// 在已有 models.json 上做增量更新：保留其它 provider、顶层字段，以及用户在
 /// mk2api provider 里自定义的字段，只覆盖我们托管的 baseUrl / api / apiKey / models。
 pub fn pi_models_payload(current: &Value, base_url: &str, api_key: &str, models: &[ModelInfo]) -> Value {
-    let ids = model_ids(models);
-    let payload_models = ordered_model_ids(&ids)
+    let payload_models = pi_model_ids(models)
         .into_iter()
         .map(|id| {
             let meta = meta_for(models, &id);
             json!({
                 "id": id,
-                "name": display_name(&id),
+                "name": meta.map(display_name).unwrap_or_else(|| pretty_short(&id)),
                 "reasoning": true,
                 "input": ["text", "image"],
                 "contextWindow": meta.map(ModelInfo::advertised_context).unwrap_or(DEFAULT_CONTEXT_WINDOW),
@@ -367,24 +436,19 @@ fn merge_table_body(managed_body: &str, existing: &str, managed_keys: &[&str]) -
 }
 
 pub fn codex_catalog(models: &[ModelInfo]) -> Value {
-    let ids = model_ids(models);
-    let catalog = unique_short_ids(&ids)
+    let catalog = codex_slug_ids(models)
         .into_iter()
         .enumerate()
         .map(|(index, slug)| {
-            let full = ids
-                .iter()
-                .find(|id| *id == &slug || short_id(id) == slug && id.contains('/'))
-                .cloned()
-                .unwrap_or_else(|| slug.clone());
-            let meta = meta_for(models, &full).or_else(|| meta_for(models, &slug));
+            let meta = meta_for(models, &slug);
             let context_window = meta.map(ModelInfo::advertised_context).unwrap_or(DEFAULT_CONTEXT_WINDOW);
-            let pretty = pretty_short(&slug);
-            let effort = default_effort(&full);
+            // 渠道模型的显示名带渠道前缀，codex 的模型选择器里就能直接区分来源。
+            let pretty = meta.map(display_name).unwrap_or_else(|| pretty_short(&slug));
+            let effort = default_effort(meta.map(ModelInfo::upstream_model).unwrap_or(&slug));
             json!({
                 "slug": slug,
                 "display_name": pretty,
-                "description": format!("mk2api {pretty} ({full})."),
+                "description": format!("mk2api {pretty} ({slug})."),
                 "default_reasoning_level": effort,
                 "supported_reasoning_levels": [
                     {"effort": "low", "description": "Fast responses with lighter reasoning"},
@@ -708,7 +772,7 @@ pub fn report_json(reports: &[ClientReport], enabled: bool, manage_pi: bool, man
 }
 
 pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[ModelInfo]) -> io::Result<ClientReport> {
-    let ids = model_ids(models);
+    let ids = pi_model_ids(models);
     if !paths.pi_detected() {
         return Ok(ClientReport {
             name: "pi".into(),
@@ -746,7 +810,7 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[Mo
         detected: true,
         managed: true,
         path: Some(paths.pi_models.display().to_string()),
-        models: ordered_model_ids(&ids).len(),
+        models: ids.len(),
         message: if owns_client {
             format!("default {default_model}")
         } else {
@@ -756,7 +820,7 @@ pub fn apply_pi(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[Mo
 }
 
 pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, models: &[ModelInfo]) -> io::Result<ClientReport> {
-    let ids = model_ids(models);
+    let ids = codex_slug_ids(models);
     if !paths.codex_detected() {
         return Ok(ClientReport {
             name: "codex".into(),
@@ -795,7 +859,7 @@ pub fn apply_codex(paths: &ClientPaths, base_url: &str, api_key: &str, models: &
                 .unwrap_or_else(|| value.to_string())
         })
         .unwrap_or_else(|| "~/.codex/codex-models.json".to_string());
-    let short_ids = unique_short_ids(&ids);
+    let short_ids = ids;
     let owns_client = codex_client_is_ours(&current);
     let current_model = extract_toml_string(&current, "model");
     let default_model = preferred_default_model(&short_ids, current_model.as_deref());
@@ -883,12 +947,7 @@ mod tests {
                 }
             }
         });
-        let payload = pi_models_payload(&current, "http://127.0.0.1:8124/v1", "mk_live_test", &[ModelInfo {
-            id: "monkeycode-basic/qwen3.8-flash".into(),
-            anthropic: false,
-            context_window: 200_000,
-            max_output: 32_000,
-        }]);
+        let payload = pi_models_payload(&current, "http://127.0.0.1:8124/v1", "mk_live_test", &[ModelInfo::builtin("monkeycode-basic/qwen3.8-flash", false, 200_000, 32_000)]);
         let providers = payload["providers"].as_object().unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(providers["monkeycode"]["baseUrl"], "http://127.0.0.1:8123/v1");
@@ -1101,12 +1160,7 @@ goals = true
         )
         .unwrap();
         std::fs::write(&paths.pi_settings, "{\"theme\":\"dark\"}\n").unwrap();
-        let models = vec![ModelInfo {
-            id: "monkeycode-basic/qwen3.8-flash".into(),
-            anthropic: false,
-            context_window: 200_000,
-            max_output: 32_000,
-        }];
+        let models = vec![ModelInfo::builtin("monkeycode-basic/qwen3.8-flash", false, 200_000, 32_000)];
         let report = apply_pi(&paths, "http://127.0.0.1:8124/v1", "mk_live_test", &models).unwrap();
         assert!(report.managed);
         let written: Value = serde_json::from_str(&std::fs::read_to_string(&paths.pi_models).unwrap()).unwrap();
@@ -1127,12 +1181,7 @@ goals = true
             "model = \"gpt-5.6-sol\"\n\n[model_providers.OpenAI]\nname = \"OpenAI\"\nbase_url = \"https://example.invalid\"\nexperimental_bearer_token = \"sk-user-key\"\n\n[features]\ngoals = true\n",
         )
         .unwrap();
-        let models = vec![ModelInfo {
-            id: "monkeycode-basic/qwen3.8-flash".into(),
-            anthropic: false,
-            context_window: 200_000,
-            max_output: 32_000,
-        }];
+        let models = vec![ModelInfo::builtin("monkeycode-basic/qwen3.8-flash", false, 200_000, 32_000)];
         let report = apply_codex(&paths, "http://127.0.0.1:8124/v1", "mk_live_test", &models).unwrap();
         assert!(report.managed);
         let written = std::fs::read_to_string(&paths.codex_config).unwrap();

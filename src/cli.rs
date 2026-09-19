@@ -51,6 +51,7 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
             Ok(())
         }
         "clients" => clients_command(&args.get(1..).unwrap_or(&[])).await,
+        "channels" | "channel" => channels_command(&args.get(1..).unwrap_or(&[])).await,
         "dashboard" | "web" => dashboard_command(&args.get(1..).unwrap_or(&[])).await,
         "help" | "-h" | "--help" => {
             print_help();
@@ -152,6 +153,12 @@ Usage:
   mk2api install      Install this binary as mk2api
   mk2api clients      Detect Pi/Codex configs and keep them pointed at mk2api
   mk2api clients sync Force-refresh managed Pi/Codex model catalogs
+  mk2api channels     List upstream channels (extra API providers)
+  mk2api channels add <name> <base_url> <api_key> [--wire chat|responses|anthropic]
+                      Add or update a channel, then pull its model list
+  mk2api channels rm <slug>          Delete a channel
+  mk2api channels refresh [slug]     Re-pull model lists (all channels when slug omitted)
+  mk2api channels enable|disable <slug>
 "
     );
 }
@@ -631,6 +638,122 @@ async fn clients_command(args: &[String]) -> Result<(), BoxError> {
         }
     }
     Ok(())
+}
+
+/// `mk2api channels`：管理 MonkeyCode 之外的上游渠道。
+///
+/// 中文说明：渠道的增删改都通过本地管理 API 完成，因此运行中的服务会立刻落盘
+/// `~/.mk2api/channels.json` 并把新模型同步进 pi / codex，不需要手工改配置文件。
+async fn channels_command(args: &[String]) -> Result<(), BoxError> {
+    let config = load_or_default()?;
+    if !health(&config).await {
+        return Err(boxed("mk2api is not running. Try: mk2api start"));
+    }
+    let admin = admin_key()?;
+    let base = format!("http://{}:{}/v1/admin/channels", display_host(&config.host), config.port);
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(120)).build()?;
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let rest = args.get(1..).unwrap_or(&[]);
+
+    let response = match action {
+        "list" | "" => client.get(&base).header("Authorization", format!("Bearer {admin}")).send().await?,
+        "add" => {
+            let positional = rest.iter().filter(|value| !value.starts_with("--")).collect::<Vec<_>>();
+            if positional.len() < 3 {
+                return Err(boxed("usage: mk2api channels add <name> <base_url> <api_key> [--wire chat|responses|anthropic] [--context N] [--max-output N]"));
+            }
+            let mut body = json!({
+                "name": positional[0],
+                "base_url": positional[1],
+                "api_key": positional[2],
+                "refresh": true,
+            });
+            let mut index = 0;
+            while index < rest.len() {
+                let flag = rest[index].as_str();
+                let value = rest.get(index + 1).map(String::as_str).unwrap_or("");
+                match flag {
+                    "--wire" => { body["wire_api"] = json!(value); index += 2; }
+                    "--context" => { body["context_window"] = json!(value.parse::<u64>().map_err(|_| boxed("--context expects a number"))?); index += 2; }
+                    "--max-output" => { body["max_output"] = json!(value.parse::<u64>().map_err(|_| boxed("--max-output expects a number"))?); index += 2; }
+                    _ => index += 1,
+                }
+            }
+            client.post(&base).header("Authorization", format!("Bearer {admin}")).json(&body).send().await?
+        }
+        "rm" | "remove" | "delete" => {
+            let slug = rest.first().ok_or_else(|| boxed("usage: mk2api channels rm <slug>"))?;
+            client.delete(format!("{base}/{}", urlencode(slug))).header("Authorization", format!("Bearer {admin}")).send().await?
+        }
+        "refresh" => {
+            let url = match rest.first() {
+                Some(slug) => format!("{base}/{}/refresh", urlencode(slug)),
+                None => format!("{base}/refresh-all"),
+            };
+            client.post(&url).header("Authorization", format!("Bearer {admin}")).send().await?
+        }
+        "enable" | "disable" => {
+            let slug = rest.first().ok_or_else(|| boxed(format!("usage: mk2api channels {action} <slug>")))?;
+            let body = json!({"enabled": action == "enable"});
+            client.post(format!("{base}/{}", urlencode(slug))).header("Authorization", format!("Bearer {admin}")).json(&body).send().await?
+        }
+        other => return Err(boxed(format!("unknown channels action: {other}\n{CHANNELS_HELP}"))),
+    };
+
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(boxed(format!("channels {action} failed ({status}): {text}")));
+    }
+    let data: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    print_channels(&data);
+    Ok(())
+}
+
+const CHANNELS_HELP: &str = "usage: mk2api channels [list|add|rm|refresh|enable|disable]";
+
+fn urlencode(value: &str) -> String {
+    // 逐字节编码：非 ASCII 的 UTF-8 字节也要拆开（slug 虽然只有 ASCII，但这里不依赖这一点）。
+    let mut out = String::new();
+    for byte in value.bytes() {
+        let ch = byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            out.push(ch);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn print_channels(data: &Value) {
+    if let Some(path) = data.get("path").and_then(Value::as_str) {
+        println!("channels file: {path}");
+    }
+    let items = data.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("no upstream channels configured. Add one with: mk2api channels add <name> <base_url> <api_key>");
+        return;
+    }
+    println!("{:<16} {:<14} {:>6}  {:<18} {}", "NAME", "SLUG", "MODELS", "WIRE", "BASE URL");
+    for item in &items {
+        let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        let models = item.get("model_count").and_then(Value::as_u64).unwrap_or(0);
+        let flag = if item.get("enabled").and_then(Value::as_bool).unwrap_or(true) { "" } else { "  [disabled]" };
+        println!("{:<16} {:<14} {models:>6}  {:<18} {}{flag}", text("name"), text("slug"), text("wire_api"), text("base_url"));
+        if let Some(error) = item.get("last_error").and_then(Value::as_str) {
+            println!("{:>16}   ! {error}", "");
+        }
+    }
+    for item in &items {
+        let slug = item.get("slug").and_then(Value::as_str).unwrap_or("-");
+        let ids = item.get("models").and_then(Value::as_array).cloned().unwrap_or_default();
+        if ids.is_empty() {
+            continue;
+        }
+        let sample = ids.iter().take(3).filter_map(Value::as_str).map(|id| format!("{slug}/{id}")).collect::<Vec<_>>().join(", ");
+        println!("  {slug}: {sample}{}", if ids.len() > 3 { format!(" … 共 {} 个", ids.len()) } else { String::new() });
+    }
 }
 
 fn admin_key() -> Result<String, BoxError> {

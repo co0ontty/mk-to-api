@@ -25,6 +25,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 mod anthropic;
+mod channels;
+mod chatwire;
 mod cli;
 mod clients;
 mod dashboard;
@@ -47,6 +49,7 @@ struct Config {
     tls_key: Option<PathBuf>,
     key_path: PathBuf,
     settings_path: PathBuf,
+    channels_path: PathBuf,
     api_keys_path: PathBuf,
     usage_path: PathBuf,
     admin_key_path: PathBuf,
@@ -101,6 +104,8 @@ struct AppState {
     // 管理台密钥可在线修改，用标准库 RwLock（只在极短临界区加锁，不跨 await）。
     admin_key: Arc<std::sync::RwLock<String>>,
     client_manage: Arc<std::sync::RwLock<ClientManage>>,
+    /// 上游渠道表。读写都在极短临界区完成，不跨 await，因此用标准库 RwLock。
+    channels: Arc<std::sync::RwLock<Vec<channels::Channel>>>,
     api_keys: Arc<Mutex<ApiKeyStore>>,
     usage: Arc<Mutex<UsageStore>>,
     started_at: u64,
@@ -258,6 +263,7 @@ impl Config {
         let config_dir = configured_path(args, &file, "config-dir", "MK2API_HOME", default_dir.clone());
         let key_path = configured_path(args, &file, "key-file", "MONKEYCODE_OHMYAGENT_KEY", legacy_dir.join("monkeycode-ohmyagent-key.json"));
         let settings_path = configured_path(args, &file, "settings", "OHMYAGENT_SETTINGS", legacy_dir.join("ohmyagent/settings.json"));
+        let channels_path = configured_path(args, &file, "channels-file", "MK2API_CHANNELS_FILE", config_dir.join("channels.json"));
         let api_keys_path = configured_path(args, &file, "api-keys-file", "DIRECT_GATEWAY_API_KEYS_FILE", config_dir.join("api-keys.json"));
         let usage_path = configured_path(args, &file, "usage-file", "DIRECT_GATEWAY_USAGE_FILE", config_dir.join("usage.json"));
         let admin_key_path = configured_path(args, &file, "admin-key-file", "DIRECT_GATEWAY_ADMIN_KEY_FILE", config_dir.join("admin.key"));
@@ -293,6 +299,7 @@ impl Config {
             tls_key,
             key_path,
             settings_path,
+            channels_path,
             api_keys_path,
             usage_path,
             admin_key_path,
@@ -607,7 +614,7 @@ pub(crate) fn usage_tokens(usage: Option<&Value>) -> (u64, u64) {
     (usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0), usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0))
 }
 
-async fn record_usage(state: &AppState, key_id: &str, model: &str, endpoint: &str, status: StatusCode, started: std::time::Instant, usage: Option<&Value>) {
+pub(crate) async fn record_usage(state: &AppState, key_id: &str, model: &str, endpoint: &str, status: StatusCode, started: std::time::Instant, usage: Option<&Value>) {
     let (input_tokens, output_tokens) = usage_tokens(usage);
     let record = UsageRecord { timestamp: now(), key_id: key_id.to_string(), model: model.to_string(), endpoint: endpoint.to_string(), status: status.as_u16(), latency_ms: started.elapsed().as_millis() as u64, input_tokens, output_tokens };
     let snapshot = {
@@ -1061,10 +1068,47 @@ struct Runtime {
     base_url: String,
     api_key: String,
     model: String,
-    signing_secret: String,
-    anthropic: bool,
+    /// 只有 MonkeyCode 内置上游需要 HMAC 签名；渠道走普通 Bearer。
+    signing_secret: Option<String>,
+    wire: channels::Wire,
+    /// 渠道自定义请求头。
+    headers: Vec<(String, String)>,
     max_output: u64,
     thinking_effort: Option<String>,
+}
+
+impl Runtime {
+    fn anthropic(&self) -> bool {
+        self.wire.is_anthropic()
+    }
+}
+
+/// 按模型 ID 前缀找渠道。只有启用中的渠道参与匹配。
+fn channel_for_model(state: &AppState, requested: &str) -> Option<channels::Channel> {
+    let guard = state.channels.read().expect("channels lock");
+    guard
+        .iter()
+        .filter(|channel| channel.enabled)
+        .find(|channel| channel.upstream_model(requested).is_some())
+        .cloned()
+}
+
+/// 命中了被停用的渠道时返回该渠道名。
+///
+/// 中文说明：停用渠道后它的模型从 `/v1/models` 里消失，但客户端可能还留着旧配置。
+/// 如果不拦一下，请求会掉进 MonkeyCode 分支，报出「OhMyAgent key 读不到」这种
+/// 与真正原因无关的配置错误，排查时很坑。
+fn disabled_channel_for_model(state: &AppState, requested: &str) -> Option<String> {
+    let guard = state.channels.read().expect("channels lock");
+    guard
+        .iter()
+        .find(|channel| !channel.enabled && channel.upstream_model(requested).is_some())
+        .map(|channel| channel.name.clone())
+}
+
+/// 渠道表的快照（用于模型目录与客户端同步）。
+fn channel_snapshot(state: &AppState) -> Vec<channels::Channel> {
+    state.channels.read().expect("channels lock").clone()
 }
 
 fn same_url(left: &str, right: &str) -> bool {
@@ -1124,7 +1168,24 @@ fn resolve_model_for_runtime<'a>(filtered: &'a [Value], all: &'a [Value], reques
     None
 }
 
-async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime, GatewayError> {
+async fn load_runtime(state: &AppState, requested_model: &str) -> Result<Runtime, GatewayError> {
+    if let Some(channel) = channel_for_model(state, requested_model) {
+        let upstream = channel.upstream_model(requested_model).unwrap_or_else(|| requested_model.to_string());
+        return Ok(Runtime {
+            base_url: channel.base_url.clone(),
+            api_key: channel.api_key.clone(),
+            model: upstream,
+            signing_secret: None,
+            wire: channel.wire,
+            headers: channel.headers.clone(),
+            max_output: 32_000,
+            thinking_effort: None,
+        });
+    }
+    let config = &state.config;
+    if let Some(name) = disabled_channel_for_model(state, requested_model) {
+        return Err(GatewayError::new(StatusCode::NOT_FOUND, format!("upstream channel is disabled: {name}")).with_code("channel_disabled"));
+    }
     let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
     let key_config = key_config?; let settings = settings?;
     let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
@@ -1153,8 +1214,9 @@ async fn load_runtime(config: &Config, requested_model: &str) -> Result<Runtime,
         base_url,
         api_key,
         model,
-        signing_secret: signing_secret.unwrap(),
-        anthropic: anthropic::is_anthropic_type(model_config.get("type").and_then(Value::as_str)),
+        signing_secret: Some(signing_secret.unwrap()),
+        wire: if anthropic::is_anthropic_type(model_config.get("type").and_then(Value::as_str)) { channels::Wire::Anthropic } else { channels::Wire::Responses },
+        headers: Vec::new(),
         max_output: model_config.get("max_output").and_then(Value::as_u64).unwrap_or(32_000),
         thinking_effort: model_thinking_effort(model_config),
     })
@@ -1212,23 +1274,65 @@ fn parse_context_limit(message: &str) -> Option<u64> {
     None
 }
 
-fn push_model_info(catalog: &mut Vec<clients::ModelInfo>, id: &str, anthropic: bool, context_window: u64, max_output: u64) {
-    if catalog.iter().any(|existing| existing.id == id) {
+/// 渠道模型的默认窗口：上游不报，只能给一个保守值，之后会按上游报错动态修正。
+const CHANNEL_DEFAULT_CONTEXT: u64 = 200_000;
+
+fn push_model_info(catalog: &mut Vec<clients::ModelInfo>, model: clients::ModelInfo) {
+    if catalog.iter().any(|existing| existing.id == model.id) {
         return;
     }
-    catalog.push(clients::ModelInfo {
-        id: id.to_string(),
-        anthropic,
-        context_window,
-        max_output,
-    });
+    catalog.push(model);
 }
 
-async fn configured_model_infos(config: &Config) -> Result<Vec<clients::ModelInfo>, GatewayError> {
-    let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
-    let key_config = key_config?; let settings = settings?;
-    let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
+/// 渠道模型目录：ID 带渠道前缀，显示名带渠道名前缀。
+fn channel_model_infos(channels: &[channels::Channel], learned: &std::collections::HashMap<String, u64>) -> Vec<clients::ModelInfo> {
+    let mut catalog = Vec::new();
+    for channel in channels.iter().filter(|channel| channel.enabled) {
+        for upstream in &channel.models {
+            let id = channel.gateway_id(upstream);
+            let context_window = channel
+                .context_window
+                .or_else(|| learned.get(&id).copied())
+                .or_else(|| learned.get(upstream).copied())
+                .or_else(|| learned.get(short_model_name(upstream)).copied())
+                .unwrap_or(CHANNEL_DEFAULT_CONTEXT);
+            push_model_info(
+                &mut catalog,
+                clients::ModelInfo::channel(
+                    &id,
+                    &channel.name,
+                    upstream,
+                    channel.wire.is_anthropic(),
+                    context_window,
+                    channel.max_output.unwrap_or(32_000),
+                ),
+            );
+        }
+    }
+    catalog
+}
+
+/// 完整模型目录：MonkeyCode 内置模型 + 上游渠道模型。
+///
+/// 中文说明：读不到 OhMyAgent 配置时（例如只配了渠道、本机没有 MonkeyCode 凭证）不再直接失败，
+/// 只要还有渠道模型就继续返回，否则整个渠道能力会被一行报错挡住。
+async fn configured_model_infos(state: &AppState) -> Result<Vec<clients::ModelInfo>, GatewayError> {
+    let config = &state.config;
     let learned = load_learned_limits(&model_limits_path(config));
+    let channel_models = channel_model_infos(&channel_snapshot(state), &learned);
+    let (key_config, settings) = tokio::join!(json_file(&config.key_path, "OhMyAgent key"), json_file(&config.settings_path, "OhMyAgent settings"));
+    let (key_config, settings) = match (key_config, settings) {
+        (Ok(key_config), Ok(settings)) => (key_config, settings),
+        (key_error, settings_error) => {
+            let error = key_error.err().or_else(|| settings_error.err()).unwrap_or_else(|| GatewayError::config("OhMyAgent configuration is unavailable"));
+            if channel_models.is_empty() {
+                return Err(error);
+            }
+            eprintln!("builtin model catalog unavailable, serving {} channel model(s): {}", channel_models.len(), error.message);
+            return Ok(channel_models);
+        }
+    };
+    let base_url = config.upstream_host.clone().or_else(|| key_config.get("base_url").and_then(Value::as_str).map(str::to_string)).unwrap_or_default().trim_end_matches('/').to_string();
     let mut catalog = Vec::new();
     for entry in models_for_upstream(&settings, &base_url) {
         let Some(id) = entry.get("model").and_then(Value::as_str) else { continue; };
@@ -1237,36 +1341,40 @@ async fn configured_model_infos(config: &Config) -> Result<Vec<clients::ModelInf
         let context_window = learned.get(id).copied().or_else(|| learned.get(short).copied()).unwrap_or(listed);
         let max_output = entry.get("max_output").and_then(Value::as_u64).unwrap_or(32_000);
         let anthropic = anthropic::is_anthropic_type(entry.get("type").and_then(Value::as_str));
-        push_model_info(&mut catalog, id, anthropic, context_window, max_output);
+        push_model_info(&mut catalog, clients::ModelInfo::builtin(id, anthropic, context_window, max_output));
         if short != id {
-            push_model_info(&mut catalog, short, anthropic, context_window, max_output);
+            push_model_info(&mut catalog, clients::ModelInfo::builtin(short, anthropic, context_window, max_output));
         }
     }
+    catalog.extend(channel_models);
     Ok(catalog)
 }
 
-async fn configured_model_ids(config: &Config) -> Result<Vec<String>, GatewayError> {
-    Ok(clients::model_ids(&configured_model_infos(config).await?))
+async fn configured_model_ids(state: &AppState) -> Result<Vec<String>, GatewayError> {
+    Ok(clients::model_ids(&configured_model_infos(state).await?))
 }
 
 /// 模型目录：id + 协议类型，供看板「模型」页展示。
-async fn configured_model_catalog(config: &Config) -> Vec<clients::ModelInfo> {
-    configured_model_infos(config).await.unwrap_or_default()
+async fn configured_model_catalog(state: &AppState) -> Vec<clients::ModelInfo> {
+    configured_model_infos(state).await.unwrap_or_default()
 }
 
 async fn request_upstream(state: &AppState, outgoing: &Value, runtime: &Runtime) -> Result<reqwest::Response, GatewayError> {
-    let prompt = developer_prompt(outgoing);
-    let mut signer = HmacSha256::new_from_slice(runtime.signing_secret.as_bytes()).map_err(|_| GatewayError::config("invalid signing_secret"))?;
-    signer.update(prompt.as_bytes());
-    let signature = hex::encode(signer.finalize().into_bytes());
-    let path = if runtime.anthropic { "messages" } else { "responses" };
-    let mut request = state.client.post(format!("{}/{path}", runtime.base_url))
+    let mut request = state.client.post(format!("{}/{}", runtime.base_url.trim_end_matches('/'), runtime.wire.path()))
         .header(header::AUTHORIZATION, format!("Bearer {}", runtime.api_key))
-        .header("X-OhMyAgent-Signature", format!("v1={signature}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, if outgoing.get("stream").and_then(Value::as_bool).unwrap_or(false) { "text/event-stream" } else { "application/json" });
-    if runtime.anthropic {
+    if let Some(secret) = &runtime.signing_secret {
+        let prompt = developer_prompt(outgoing);
+        let mut signer = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| GatewayError::config("invalid signing_secret"))?;
+        signer.update(prompt.as_bytes());
+        request = request.header("X-OhMyAgent-Signature", format!("v1={}", hex::encode(signer.finalize().into_bytes())));
+    }
+    if runtime.anthropic() {
         request = request.header("anthropic-version", anthropic::anthropic_version());
+    }
+    for (name, value) in &runtime.headers {
+        request = request.header(name.as_str(), value.as_str());
     }
     request.json(outgoing).send().await.map_err(|e| GatewayError::new(StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).with_type("api_error").with_code("upstream_unavailable"))
 }
@@ -1508,9 +1616,11 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
     let started = std::time::Instant::now(); let cors = cors_headers(&request, &state.config);
     let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, "unknown", "chat.completions", e.status, started, None).await; return e.into_response(); } };
     let requested_model = body.get("model").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or("gpt-6-astra").to_string();
-    let runtime = match load_runtime(&state.config, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
-    let outgoing = if runtime.anthropic {
+    let runtime = match load_runtime(&state, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } };
+    let outgoing = if runtime.anthropic() {
         anthropic::to_anthropic_request_with(&body, &runtime.model, runtime.max_output, runtime.thinking_effort.as_deref())
+    } else if runtime.wire == channels::Wire::Chat {
+        chatwire::to_chat_request(&body, &runtime.model)
     } else {
         match normalize_chat_request(&body, &runtime.model) { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", e.status, started, None).await; return e.into_response(); } }
     };
@@ -1527,7 +1637,7 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
     }
     if stream {
         let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx);
-        if runtime.anthropic {
+        if runtime.anthropic() {
             let model = requested_model.clone();
             tokio::spawn(async move {
                 if let Some(completed) = anthropic::stream_as_chat(upstream, tx, model.clone()).await {
@@ -1535,14 +1645,21 @@ async fn handle_chat(request: Request<Body>, state: AppState, key_id: String) ->
                     record_usage(&state, &key_id, &model, "chat.completions", status, started, completed.get("usage")).await;
                 }
             });
+        } else if runtime.wire == channels::Wire::Chat {
+            tokio::spawn(chatwire::stream_chat_passthrough(upstream, tx, requested_model, state, key_id, started));
         } else {
             tokio::spawn(stream_chat(upstream, tx, requested_model, state, key_id, started));
         }
         return response;
     }
     let data = match upstream.json::<Value>().await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::BAD_GATEWAY, started, None).await; return GatewayError::new(StatusCode::BAD_GATEWAY, format!("invalid upstream response: {e}")).with_type("api_error").with_code("invalid_upstream_response").into_response(); } };
-    if runtime.anthropic {
+    if runtime.anthropic() {
         let chat = anthropic::to_chat_json(&data, &requested_model);
+        record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::OK, started, chat.get("usage")).await;
+        return axum::Json(chat).into_response();
+    }
+    if runtime.wire == channels::Wire::Chat {
+        let chat = chatwire::normalize_chat_response(data, &requested_model);
         record_usage(&state, &key_id, &requested_model, "chat.completions", StatusCode::OK, started, chat.get("usage")).await;
         return axum::Json(chat).into_response();
     }
@@ -1555,9 +1672,11 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     let started = std::time::Instant::now(); let cors = cors_headers(&request, &state.config);
     let body = match read_json(request, state.config.max_body_bytes).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, "unknown", "responses", e.status, started, None).await; return e.into_response(); } };
     let requested_model = body.get("model").and_then(Value::as_str).filter(|v| !v.is_empty()).unwrap_or("gpt-6-astra").to_string();
-    let runtime = match load_runtime(&state.config, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", e.status, started, None).await; return e.into_response(); } };
-    let outgoing = if runtime.anthropic {
+    let runtime = match load_runtime(&state, &requested_model).await { Ok(v) => v, Err(e) => { record_usage(&state, &key_id, &requested_model, "responses", e.status, started, None).await; return e.into_response(); } };
+    let outgoing = if runtime.anthropic() {
         anthropic::to_anthropic_request_with(&body, &runtime.model, runtime.max_output, runtime.thinking_effort.as_deref())
+    } else if runtime.wire == channels::Wire::Chat {
+        chatwire::to_chat_request(&body, &runtime.model)
     } else {
         normalize_responses_request(&body, &runtime.model, &developer_prompt(&body))
     };
@@ -1574,10 +1693,18 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     }
     if stream {
         let (tx, rx) = mpsc::channel(16); let response = sse_response(cors, rx);
-        if runtime.anthropic {
+        if runtime.anthropic() {
             let model = requested_model.clone();
             tokio::spawn(async move {
                 if let Some(completed) = anthropic::stream_as_responses(upstream, tx, model.clone()).await {
+                    let status = if completed.get("status").and_then(Value::as_str) == Some("failed") { StatusCode::BAD_GATEWAY } else { StatusCode::OK };
+                    record_usage(&state, &key_id, &model, "responses", status, started, completed.get("usage")).await;
+                }
+            });
+        } else if runtime.wire == channels::Wire::Chat {
+            let model = requested_model.clone();
+            tokio::spawn(async move {
+                if let Some(completed) = chatwire::stream_as_responses(upstream, tx, model.clone()).await {
                     let status = if completed.get("status").and_then(Value::as_str) == Some("failed") { StatusCode::BAD_GATEWAY } else { StatusCode::OK };
                     record_usage(&state, &key_id, &model, "responses", status, started, completed.get("usage")).await;
                 }
@@ -1589,7 +1716,13 @@ async fn handle_responses(request: Request<Body>, state: AppState, key_id: Strin
     }
     match upstream.json::<Value>().await {
         Ok(data) => {
-            let payload = if runtime.anthropic { anthropic::to_responses_json(&data, &requested_model) } else { data };
+            let payload = if runtime.anthropic() {
+                anthropic::to_responses_json(&data, &requested_model)
+            } else if runtime.wire == channels::Wire::Chat {
+                chatwire::to_responses_json(&data, &requested_model)
+            } else {
+                data
+            };
             record_usage(&state, &key_id, &requested_model, "responses", StatusCode::OK, started, payload.get("usage")).await;
             axum::Json(payload).into_response()
         },
@@ -1708,7 +1841,7 @@ async fn handle_admin_models(request: Request<Body>, state: AppState) -> Respons
     if !admin_authorized(&request, &state) {
         return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
     }
-    let catalog = configured_model_catalog(&state.config).await;
+    let catalog = configured_model_catalog(&state).await;
     json_response(&request, &state.config, StatusCode::OK, dashboard::models(&catalog))
 }
 
@@ -1747,6 +1880,19 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     if path == "/v1/admin/models" && request.method() == axum::http::Method::GET { return handle_admin_models(request, state).await; }
     if path == "/v1/admin/logs" && request.method() == axum::http::Method::GET { return handle_admin_logs(request, state).await; }
     if path == "/v1/admin/usage" && request.method() == axum::http::Method::GET { return handle_admin_usage(request, state).await; }
+    if path == "/v1/admin/channels" {
+        if request.method() == axum::http::Method::GET { return handle_admin_channels(request, state, None, "list").await; }
+        if request.method() == axum::http::Method::POST { return handle_admin_channels(request, state, None, "upsert").await; }
+    }
+    if path == "/v1/admin/channels/refresh-all" && request.method() == axum::http::Method::POST { return handle_admin_channels(request, state, None, "refresh_all").await; }
+    if let Some(rest) = path.strip_prefix("/v1/admin/channels/") {
+        if let Some(slug) = rest.strip_suffix("/refresh") {
+            if request.method() == axum::http::Method::POST { return handle_admin_channels(request, state, Some(slug), "refresh").await; }
+        }
+        if request.method() == axum::http::Method::GET { return handle_admin_channels(request, state, Some(rest), "get").await; }
+        if request.method() == axum::http::Method::POST { return handle_admin_channels(request, state, Some(rest), "upsert").await; }
+        if request.method() == axum::http::Method::DELETE { return handle_admin_channels(request, state, Some(rest), "delete").await; }
+    }
     if path == "/v1/admin/clients" && request.method() == axum::http::Method::PATCH { return handle_admin_clients_settings(request, state).await; }
     if (path == "/v1/admin/clients" || path == "/v1/admin/clients/sync") && matches!(request.method(), &axum::http::Method::GET | &axum::http::Method::POST) { return handle_admin_clients(request, state).await; }
     if path == "/v1/admin/keys" {
@@ -1764,8 +1910,8 @@ async fn listener(state: AppState, request: Request<Body>) -> Response {
     let token = request_api_key(&request).map(str::to_owned);
     let Some(key_id) = authenticated_key_id(token, &state).await else { return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid API key").with_type("authentication_error").with_code("invalid_api_key")); };
     if request.method() == axum::http::Method::GET && (path == "/models" || path == "/v1/models") {
-        return match configured_model_infos(&state.config).await {
-            Ok(models) => json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": models.into_iter().map(|model| json!({"id": model.id, "object": "model", "created": 0, "owned_by": "monkeycode", "context_window": model.advertised_context(), "max_output_tokens": model.max_output})).collect::<Vec<_>>() })),
+        return match configured_model_infos(&state).await {
+            Ok(models) => json_response(&request, &state.config, StatusCode::OK, json!({"object": "list", "data": models.into_iter().map(|model| json!({"id": model.id, "object": "model", "created": 0, "owned_by": model.channel.clone().unwrap_or_else(|| "monkeycode".to_string()), "context_window": model.advertised_context(), "max_output_tokens": model.max_output})).collect::<Vec<_>>() })),
             Err(e) => error_response(&request, &state.config, e),
         };
     }
@@ -1779,9 +1925,12 @@ async fn main() -> Result<(), BoxError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("") {
         "serve" => return run_server(&args[1..]).await,
-        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "dashboard" | "web" | "help" | "-h" | "--help" => return cli::run(&args).await,
+        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "channels" | "channel" | "dashboard" | "web" | "help" | "-h" | "--help" => return cli::run(&args).await,
         "" => return cli::run(&[]).await,
-        _ => {}
+        // 只有「-」开头的才算服务端参数（`mk2api --port 9000`）；其余词一律当子命令，
+        // 否则打错的命令会静默起一个服务进程，用户会以为命令已经生效。
+        other if other.starts_with('-') => {}
+        _ => return cli::run(&args).await,
     }
     run_server(&args).await
 }
@@ -1855,7 +2004,7 @@ async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientRep
             clients::skipped("codex", paths.codex_config, codex_detected, "disabled"),
         ]);
     }
-    let models = match configured_model_infos(&state.config).await {
+    let models = match configured_model_infos(&state).await {
         Ok(models) => models,
         Err(error) => {
             eprintln!("client sync catalog unavailable: {}", error.message);
@@ -1887,7 +2036,7 @@ async fn sync_managed_clients(state: &AppState) -> Result<Vec<clients::ClientRep
 
 async fn clients_payload(state: &AppState) -> Result<Value, BoxError> {
     let reports = sync_managed_clients(state).await?;
-    let ids = configured_model_ids(&state.config).await.unwrap_or_else(|_| Vec::new());
+    let ids = configured_model_ids(&state).await.unwrap_or_else(|_| Vec::new());
     let base_url = clients::local_base_url(&state.config.host, state.config.port, state.config.tls_cert.is_some());
     let manage = client_manage_of(state);
     Ok(clients::report_json(&reports, manage.enabled, manage.pi, manage.codex, &base_url, ids.len()))
@@ -1914,6 +2063,205 @@ async fn client_sync_loop(state: AppState) {
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
+}
+
+/// 渠道表落盘并更新内存状态。渠道文件里有明文 api_key，因此用 0600 权限写入。
+async fn save_channels(state: &AppState, channels: &[channels::Channel]) -> Result<(), BoxError> {
+    let contents = serde_json::to_string_pretty(&channels::to_json(channels))? + "\n";
+    write_private(&state.config.channels_path, &contents).await?;
+    *state.channels.write().expect("channels lock") = channels.to_vec();
+    Ok(())
+}
+
+/// 重新发现单个渠道的模型列表：结果与错误都写回该渠道，供管理台展示。
+async fn discover_channel_models(state: &AppState, channels: &mut [channels::Channel], index: usize) {
+    let channel = channels[index].clone();
+    match channels::discover_models(&state.client, &channel).await {
+        Ok(models) => {
+            if models != channel.models {
+                println!("channel {} models: {} -> {}", channel.slug, channel.models.len(), models.len());
+            }
+            channels[index].models = models;
+            channels[index].last_error = None;
+        }
+        Err(error) => {
+            eprintln!("channel {} model discovery failed: {error}", channel.slug);
+            channels[index].last_error = Some(error);
+        }
+    }
+    channels[index].updated_at = now();
+}
+
+/// 刷新所有启用渠道的模型列表，返回模型有变化的渠道数。
+async fn refresh_all_channels(state: &AppState, only: Option<&str>) -> Result<usize, BoxError> {
+    let mut list = channel_snapshot(state);
+    if list.is_empty() {
+        return Ok(0);
+    }
+    let before = list.clone();
+    let mut changed = 0;
+    for index in 0..list.len() {
+        if !list[index].enabled || only.is_some_and(|slug| slug != list[index].slug) {
+            continue;
+        }
+        discover_channel_models(state, &mut list, index).await;
+        if list[index].models != before[index].models {
+            changed += 1;
+        }
+    }
+    save_channels(state, &list).await?;
+    if changed > 0 {
+        let _ = sync_managed_clients(state).await;
+    }
+    Ok(changed)
+}
+
+/// 渠道后台任务：10 分钟重新发现一次上游模型，并在 channels.json 被手工改动时热加载。
+async fn channel_sync_loop(state: AppState) {
+    let mut stamp = channels_stamp(&state.config.channels_path);
+    let mut ticks: u64 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        ticks += 1;
+        let current = channels_stamp(&state.config.channels_path);
+        if current != stamp {
+            stamp = current;
+            let reloaded = channels::load(&state.config.channels_path);
+            if reloaded != channel_snapshot(&state) {
+                println!("reloaded {} upstream channel(s) from {}", reloaded.len(), state.config.channels_path.display());
+                *state.channels.write().expect("channels lock") = reloaded;
+                let _ = sync_managed_clients(&state).await;
+            }
+        }
+        if ticks % 10 == 0 && refresh_all_channels(&state, None).await.is_ok() {
+            stamp = channels_stamp(&state.config.channels_path);
+        }
+    }
+}
+
+/// 渠道文件指纹：修改时间 + 长度，用于检测外部手工编辑。
+fn channels_stamp(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let seconds = modified.duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as u64).unwrap_or(0);
+    Some((seconds, metadata.len()))
+}
+
+fn channels_missing_key(channel: &channels::Channel) -> bool {
+    channel.api_key.is_empty()
+}
+
+/// 渠道管理：`/v1/admin/channels`（列表 / 新增 / 更新 / 删除 / 刷新模型）。
+/// 每次写入都会立刻重同步 pi / codex，客户端模型列表马上能看到新渠道。
+async fn handle_admin_channels(request: Request<Body>, state: AppState, slug: Option<&str>, action: &str) -> Response {
+    if !admin_authorized(&request, &state) {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::UNAUTHORIZED, "invalid admin API key").with_type("authentication_error").with_code("invalid_admin_key"));
+    }
+    let mut list = channel_snapshot(&state);
+    match action {
+        "list" => {
+            return json_response(&request, &state.config, StatusCode::OK, channel_list_payload(&state, &list));
+        }
+        "get" => {
+            let Some(channel) = list.iter().find(|channel| channel.slug == slug.unwrap_or("")) else {
+                return error_response(&request, &state.config, GatewayError::new(StatusCode::NOT_FOUND, format!("unknown channel: {}", slug.unwrap_or(""))).with_code("channel_not_found"));
+            };
+            return json_response(&request, &state.config, StatusCode::OK, json!({"channel": channels::public_json(channel)}));
+        }
+        "delete" => {
+            let slug = slug.unwrap_or("");
+            let before = list.len();
+            list.retain(|channel| channel.slug != slug);
+            if list.len() == before {
+                return error_response(&request, &state.config, GatewayError::new(StatusCode::NOT_FOUND, format!("unknown channel: {slug}")).with_code("channel_not_found"));
+            }
+            if let Err(error) = save_channels(&state, &list).await {
+                return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save channels: {error}")).with_type("api_error").into_response();
+            }
+            println!("deleted upstream channel {slug}");
+            return channels_saved_response(request, state).await;
+        }
+        "refresh_all" => {
+            if let Err(error) = refresh_all_channels(&state, None).await {
+                return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save channels: {error}")).with_type("api_error").into_response();
+            }
+            return channels_saved_response(request, state).await;
+        }
+        "refresh" => {
+            let slug = slug.unwrap_or("");
+            if !list.iter().any(|channel| channel.slug == slug) {
+                return error_response(&request, &state.config, GatewayError::new(StatusCode::NOT_FOUND, format!("unknown channel: {slug}")).with_code("channel_not_found"));
+            }
+            if let Err(error) = refresh_all_channels(&state, Some(slug)).await {
+                return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save channels: {error}")).with_type("api_error").into_response();
+            }
+            return channels_saved_response(request, state).await;
+        }
+        _ => {}
+    }
+
+    let empty_request = Request::new(Body::empty());
+    let mut body = match read_json(request, state.config.max_body_bytes).await {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let request = empty_request;
+    if !body.is_object() {
+        return GatewayError::new(StatusCode::BAD_REQUEST, "expected a JSON object").with_type("invalid_request_error").into_response();
+    }
+    let index = slug.and_then(|slug| list.iter().position(|channel| channel.slug == slug));
+    if slug.is_some() && index.is_none() {
+        return error_response(&request, &state.config, GatewayError::new(StatusCode::NOT_FOUND, format!("unknown channel: {}", slug.unwrap_or(""))).with_code("channel_not_found"));
+    }
+    // 更新时不改 slug：改的只是显示名，客户端里已配置的模型 ID 必须保持稳定。
+    if let Some(index) = index {
+        if body.get("slug").is_none() {
+            body["slug"] = json!(list[index].slug);
+        }
+    }
+    let existing = index.map(|index| list[index].clone());
+    let channel = match channels::channel_from_body(&body, existing.as_ref(), &list) {
+        Ok(channel) => channel,
+        Err(message) => return GatewayError::new(StatusCode::BAD_REQUEST, message).with_type("invalid_request_error").into_response(),
+    };
+    let index = match index {
+        Some(index) => {
+            list[index] = channel;
+            index
+        }
+        None => {
+            list.push(channel);
+            list.len() - 1
+        }
+    };
+    // 新增时默认自动拉一次模型列表；也可以传 models 手写，或 {"refresh": false} 跳过。
+    let refresh = body.get("refresh").and_then(Value::as_bool).unwrap_or(list[index].models.is_empty());
+    if refresh && !channels_missing_key(&list[index]) {
+        discover_channel_models(&state, &mut list, index).await;
+    }
+    if let Err(error) = save_channels(&state, &list).await {
+        return GatewayError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("cannot save channels: {error}")).with_type("api_error").into_response();
+    }
+    println!("saved upstream channel {} ({}, {} models) -> {}", list[index].slug, list[index].wire.as_str(), list[index].models.len(), state.config.channels_path.display());
+    channels_saved_response(request, state).await
+}
+
+/// 渠道写操作的统一返回：渠道列表 + 客户端同步结果，前端一次请求就能刷新全部视图。
+async fn channels_saved_response(request: Request<Body>, state: AppState) -> Response {
+    let list = channel_snapshot(&state);
+    let mut payload = channel_list_payload(&state, &list);
+    if let Ok(clients) = clients_payload(&state).await {
+        payload["clients"] = clients;
+    }
+    json_response(&request, &state.config, StatusCode::OK, payload)
+}
+
+fn channel_list_payload(state: &AppState, list: &[channels::Channel]) -> Value {
+    json!({
+        "object": "list",
+        "path": state.config.channels_path.display().to_string(),
+        "data": list.iter().map(channels::public_json).collect::<Vec<_>>(),
+    })
 }
 
 async fn handle_admin_clients(request: Request<Body>, state: AppState) -> Response {
@@ -1965,6 +2313,10 @@ async fn run_server(args: &[String]) -> Result<(), BoxError> {
     if generated_admin_key {
         println!("generated Admin Key (save it securely): {admin_key}");
     }
+    let channel_list = channels::load(&config.channels_path);
+    if !channel_list.is_empty() {
+        println!("loaded {} upstream channel(s) from {}", channel_list.len(), config.channels_path.display());
+    }
     let api_keys = ApiKeyStore::load(config.api_keys_path.clone()).await?;
     let usage = UsageStore::load(config.usage_path.clone(), config.max_usage_records).await?;
     let started_at = now();
@@ -1973,11 +2325,14 @@ async fn run_server(args: &[String]) -> Result<(), BoxError> {
         client,
         admin_key: Arc::new(std::sync::RwLock::new(admin_key)),
         client_manage: Arc::new(std::sync::RwLock::new(ClientManage::from_config(&config))),
+        channels: Arc::new(std::sync::RwLock::new(channel_list)),
         api_keys: Arc::new(Mutex::new(api_keys)),
         usage: Arc::new(Mutex::new(usage)),
         started_at,
     };
     tokio::spawn(client_sync_loop(state.clone()));
+    // 启动时可能还没有渠道（之后由控制台/CLI 添加），因此无条件起这个循环。
+    tokio::spawn(channel_sync_loop(state.clone()));
     let state_for_fallback = state.clone();
     let fallback = tower::service_fn(move |request: Request<Body>| {
         let state = state_for_fallback.clone();
