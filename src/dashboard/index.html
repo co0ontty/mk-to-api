@@ -90,6 +90,7 @@ code,.mono{font-family:var(--mono)}
 .client-row .name{font-weight:600}
 .client-row .path{color:var(--dim);font-size:12.5px;margin-top:3px;word-break:break-all}
 .client-row .meta{display:flex;align-items:center;gap:12px;flex:none}
+.master-toggle{display:flex;align-items:center;gap:9px;font-size:13.5px;color:var(--muted)}
 .client-note{font-size:13px;color:var(--dim);margin:0 0 8px}
 
 /* ---------- 卡片 ---------- */
@@ -381,10 +382,13 @@ label.field{display:flex;flex-direction:column;gap:8px;font-size:13.5px;color:va
               <div class="hint">自动把本机 CLI 的 provider 指向 mk2api，模型增减会写回配置</div>
             </div>
             <div class="toolbar">
-              <label class="switch" title="总开关：关闭后不再改写任何 CLI 配置">
-                <input type="checkbox" id="manageClients" checked>
-                <span></span>
-              </label>
+              <div class="master-toggle" title="总开关：关闭后不再改写任何 CLI 配置">
+                <span>总开关</span>
+                <label class="switch">
+                  <input type="checkbox" id="manageClients" checked>
+                  <span></span>
+                </label>
+              </div>
               <button class="btn sm" id="syncClients">立即同步</button>
             </div>
           </div>
