@@ -1925,7 +1925,7 @@ async fn main() -> Result<(), BoxError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("") {
         "serve" => return run_server(&args[1..]).await,
-        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "channels" | "channel" | "dashboard" | "web" | "help" | "-h" | "--help" => return cli::run(&args).await,
+        "start" | "stop" | "restart" | "status" | "tui" | "install" | "setup" | "clients" | "channels" | "channel" | "dashboard" | "web" | "help" | "version" | "-h" | "--help" | "-V" | "--version" => return cli::run(&args).await,
         "" => return cli::run(&[]).await,
         // 只有「-」开头的才算服务端参数（`mk2api --port 9000`）；其余词一律当子命令，
         // 否则打错的命令会静默起一个服务进程，用户会以为命令已经生效。

@@ -57,6 +57,10 @@ pub async fn run(args: &[String]) -> Result<(), BoxError> {
             print_help();
             Ok(())
         }
+        "version" | "-V" | "--version" => {
+            println!("mk2api {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "" => {
             install_command()?;
             if !health(&load_or_default()?).await {
@@ -159,6 +163,7 @@ Usage:
   mk2api channels rm <slug>          Delete a channel
   mk2api channels refresh [slug]     Re-pull model lists (all channels when slug omitted)
   mk2api channels enable|disable <slug>
+  mk2api --version    Print the version
 "
     );
 }
